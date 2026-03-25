@@ -72,6 +72,8 @@ The outputs are saved in `runs` directory.
 
 1. **Create conda environment:**
 ```bash
+git clone https://github.com/dreamzero0/dreamzero.git
+cd dreamzero
 conda create -n dreamzero python=3.11
 conda activate dreamzero
 ```
@@ -104,7 +106,8 @@ pip install transformer_engine==2.10.0 transformer_engine_cu12==2.10.0 transform
 We release a 14B pretrained DROID checkpoint on [Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-DROID). To download the checkpoint, run
 
 ```bash
-hf download GEAR-Dreams/DreamZero-DROID --repo-type model --local-dir <path/to/checkpoint>
+mkdir -p ~/dreamzero/huggingface_checkpoints
+hf download GEAR-Dreams/DreamZero-DROID --repo-type model --local-dir ~/dreamzero/huggingface_checkpoints
 ```
 
 ### DreamZero-AgiBot (for fine-tuning on new embodiments)
@@ -124,7 +127,12 @@ hf download GEAR-Dreams/DreamZero-AgiBot --repo-type model --local-dir ./checkpo
 The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/DreamZero-AgiBot` by default. See the [new embodiment guide](docs/DATASET_TO_GEAR_AND_TRAIN.md) for usage.
 
 ## Running the Inference Server
-
+### Avantbot Specific
+```bash
+# Running the 14B parameter Model
+cd ~/dreamzero
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints 
+```
 ### Command Overview
 
 The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:

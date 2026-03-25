@@ -549,8 +549,11 @@ class VLA(PreTrainedModel):
             config.action_head_cfg['defer_lora_injection'] = False
             print("config.action_head_cfg['defer_lora_injection'] disabled (set to False)")
 
-        # Instantiate model
-        model = cls(config)
+        # Instantiate model in bfloat16 to reduce CPU memory during loading
+        # (weights on disk are already bf16; this avoids a costly fp32 intermediate)
+        with torch.device("meta"):
+            model = cls(config)
+        model = model.to_empty(device="cpu").to(dtype=torch.bfloat16)
         print("model", model)
         # Remove .base_layer from keys (e.g., 'action_head.model.base_model.model.blocks.19.self_attn.v.base_layer.bias' -> 'action_head.model.base_model.model.blocks.19.self_attn.v.bias')
         has_base_layer = any(".base_layer." in key for key in state_dict.keys())
