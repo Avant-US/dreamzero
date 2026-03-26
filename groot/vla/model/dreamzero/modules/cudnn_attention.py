@@ -17,7 +17,14 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 import transformer_engine
 
-_TE_VER = tuple(int(x) for x in transformer_engine.__version__.split(".")[:2])
+_te_version = getattr(transformer_engine, "__version__", None)
+if _te_version is None:
+    try:
+        from importlib.metadata import version as _pkg_version
+        _te_version = _pkg_version("transformer_engine")
+    except Exception:
+        _te_version = "0.0"
+_TE_VER = tuple(int(x) for x in _te_version.split(".")[:2])
 
 
 try:
