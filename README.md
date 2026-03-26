@@ -67,12 +67,18 @@ The outputs are saved in `runs` directory.
 - **Hardware**: Multi-GPU setup (tested on GB200, H100)
   - Minimum: 2 GPUs for distributed inference
 - **CUDA**: Compatible GPU with CUDA 12.9+
+- **Conda**
+  ```bash
+  # Miniconda Installation
+  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+  bash Miniconda3-latest-Linux-x86_64.sh
+  ```
 
 ### Installation
 
 1. **Create conda environment:**
 ```bash
-git clone https://github.com/dreamzero0/dreamzero.git
+git clone --recurse-submodules git@github.com:Avant-US/dreamzero.git
 cd dreamzero
 conda create -n dreamzero python=3.11
 conda activate dreamzero
@@ -131,7 +137,8 @@ The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/Dre
 ```bash
 # Running the 14B parameter Model
 cd ~/dreamzero
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints 
+DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path    
+  ./huggingface_checkpoints  
 ```
 ### Command Overview
 
@@ -162,6 +169,21 @@ python test_client_AR.py --port 5000
 - `--timeout-seconds`: Server timeout in seconds (default: 50000)
 - `--index`: Index for output directory naming (default: 0)
 
+### Performance Summary
+
+Measured on RTX PRO 6000 Blackwell (single GPU, no TensorRT) with DiT caching, dynamic cache scheduling, and `NUM_DIT_STEPS=5`:
+
+| Component | Time | Notes |
+|---|---|---|
+| **Total inference** | **3.1 – 4.5s** (avg ~3.7s) | End-to-end per action chunk |
+| Diffusion | 2.3 – 3.7s | Dominant bottleneck (~75% of total) |
+| DIT Compute Steps | 4–6 steps | Dynamic cache skips redundant steps (vs 16 baseline) |
+| KV Cache Creation | 0.35 – 0.68s | |
+| Image Encoder | 0.38s first call, 0.00s cached | |
+| Text Encoder | 0.05s | |
+| VAE | 0.00 – 0.10s | |
+
+For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The pre-built TensorRT engine is not compatible with the RTX PRO 6000 and must be rebuilt for that platform.
 
 ### Output
 

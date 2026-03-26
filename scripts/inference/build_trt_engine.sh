@@ -129,7 +129,7 @@ fi
 torchrun \
     --standalone \
     --nproc_per_node=1 \
-    "${REPO_ROOT}/scripts/inference/build_trt_engine_droid.py" \
+    "${REPO_ROOT}/scripts/inference/build_trt_engine.py" \
     "${PYTHON_ARGS[@]}"
 
 echo "=========================================="

@@ -336,77 +336,83 @@ def export_to_onnx_14B(pytorch_model, test_inputs, onnx_path="tensorrt/wan_model
         return None
 
 
+def _parse_shape_str(shape_str):
+    """Parse a trtexec-style shape string like 'name:1x2x3,name2:4x5' into a dict of {name: tuple}."""
+    result = {}
+    if not shape_str:
+        return result
+    for part in shape_str.split(","):
+        name, dims = part.split(":")
+        result[name] = tuple(int(d) for d in dims.split("x"))
+    return result
+
+
 def build_tensorrt_engine(onnx_path, engine_path="tensorrt/wan_model.trt", min_shape=None, max_shape=None, opt_shape=None):
-    """Build TensorRT engine from ONNX using trtexec"""
-    print("Building TensorRT engine with trtexec...")
+    """Build TensorRT engine from ONNX using the Python TensorRT API (no trtexec needed)."""
+    print("Building TensorRT engine with Python API...")
 
     if not os.path.exists(onnx_path):
         print(f"  ERROR: ONNX file not found: {onnx_path}")
         return None
 
-    # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
-
-    # Build engine using trtexec (much faster than torch_tensorrt)
-    trtexec_bin = shutil.which("trtexec") or "/opt/tensorrt/bin/trtexec"
-    cmd = [
-        trtexec_bin,
-        f"--onnx={onnx_path}",
-        f"--saveEngine={engine_path}",
-        "--fp8",
-        "--fp16",
-        "--bf16",
-        "--separateProfileRun",
-        "--profilingVerbosity=detailed",
-        "--memPoolSize=workspace:65536",
-        "--dumpProfile",
-        "--dumpLayerInfo",
-        "--useCudaGraph",
-        "--verbose",
-    ]
-
-    if min_shape is not None:
-        cmd.append(f"--minShapes={min_shape}")
-    if max_shape is not None:
-        cmd.append(f"--maxShapes={max_shape}")
-    if opt_shape is not None:
-        cmd.append(f"--optShapes={opt_shape}")
-
-    # Create log file for trtexec output
     log_file = engine_path.replace(".trt", "_build.log")
 
+    TRT_LOGGER = trt.Logger(trt.Logger.VERBOSE)
+
     try:
-        print(f"  Running: {' '.join(cmd)}")
-        print(f"  Logging output to: {log_file}")
+        builder = trt.Builder(TRT_LOGGER)
+        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        parser = trt.OnnxParser(network, TRT_LOGGER)
 
-        with open(log_file, "w") as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, timeout=600)
+        print(f"  Parsing ONNX model: {onnx_path}")
+        onnx_dir = os.path.dirname(os.path.abspath(onnx_path))
+        with open(onnx_path, "rb") as f:
+            if not parser.parse(f.read(), path=onnx_dir):
+                for i in range(parser.num_errors):
+                    print(f"  ONNX Parse Error: {parser.get_error(i)}")
+                return None
+        print(f"  ONNX parsed successfully: {network.num_inputs} inputs, {network.num_outputs} outputs")
 
-        if result.returncode == 0:
-            print(f"  TensorRT engine built successfully: {engine_path}")
-            print(f"  Build log saved to: {log_file}")
-            return engine_path
-        else:
-            print(f"  ERROR: trtexec failed with return code {result.returncode}")
-            print(f"  Check build log for details: {log_file}")
-            # Print last few lines of log file for immediate feedback
-            try:
-                with open(log_file, "r") as f:
-                    lines = f.readlines()
-                    if lines:
-                        print("  Last few lines from build log:")
-                        for line in lines[-10:]:  # Show last 10 lines
-                            print(f"    {line.rstrip()}")
-            except:
-                pass
+        config = builder.create_builder_config()
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 65536 << 20)  # 65536 MiB
+        config.set_flag(trt.BuilderFlag.FP16)
+        config.set_flag(trt.BuilderFlag.BF16)
+        config.set_flag(trt.BuilderFlag.FP8)
+        config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+        config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
+
+        # Set dynamic shape profiles
+        if min_shape or max_shape or opt_shape:
+            min_shapes = _parse_shape_str(min_shape)
+            max_shapes = _parse_shape_str(max_shape)
+            opt_shapes = _parse_shape_str(opt_shape)
+
+            profile = builder.create_optimization_profile()
+            for i in range(network.num_inputs):
+                inp = network.get_input(i)
+                name = inp.name
+                if name in min_shapes:
+                    profile.set_shape(name, min_shapes[name], opt_shapes.get(name, min_shapes[name]), max_shapes.get(name, min_shapes[name]))
+            config.add_optimization_profile(profile)
+
+        print("  Building engine (this may take several minutes)...")
+        serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
+            print("  ERROR: Engine build failed")
             return None
 
-    except subprocess.TimeoutExpired:
-        print("  ERROR: trtexec timed out after 5 minutes")
-        print(f"  Partial build log saved to: {log_file}")
-        return None
+        with open(engine_path, "wb") as f:
+            f.write(serialized_engine)
+
+        print(f"  TensorRT engine built successfully: {engine_path}")
+        print(f"  Engine size: {os.path.getsize(engine_path) / (1024**3):.2f} GB")
+        return engine_path
+
     except Exception as e:
-        print(f"  ERROR: Failed to run trtexec: {e}")
+        print(f"  ERROR: Failed to build engine: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
