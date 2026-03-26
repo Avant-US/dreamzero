@@ -228,13 +228,26 @@ These are optimizations not in Table 1 that are active
 | CFG Parallelism | 1.9x | MISSING — needs 2 GPUs, you have 1 | |
 | DiT Caching | 5.5x | ENABLED (`--enable-dit-cache`) | |
 | Torch Compile + CUDA Graphs | 8.9x | ENABLED (auto, but using FA2 fallback instead of TE) | |
-| Kernel & Scheduler Opts | 9.6x | PARTIAL — TE not installed, falling back to FA2 | (Total Inference: avg ~2.8s) <br> DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints |
+| Kernel & Scheduler Opts | 9.6x | FA2 recommended over TE on H100 (see below) | (Total Inference: avg ~2.8s) <br> ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints |
 | Quantization (NVFP4) | 16.6x | MISSING — TRT engine not built for this GPU | |
 | DreamZero-Flash | 38x | MISSING — requires specially trained checkpoint | |
 
+### FA2 vs Transformer Engine on H100
+
+The paper benchmarks TE (cuDNN fused attention) as faster than FA2 (Table 1: 9.6x vs 8.9x), but **those benchmarks were measured on GB200**. On H100, the results are reversed:
+
+| Attention Backend | Avg Inference | Diffusion Time | Notes |
+|---|---|---|---|
+| **FA2 (FlashAttention2)** | **~2.8s** | 1.8 – 2.8s | Recommended for H100 |
+| TE (cuDNN fused attn) | ~4.5s | 3.0 – 4.4s | ~60% slower on H100 |
+
+FA2 is extremely well-optimized for H100/Hopper, while TE's cuDNN attention kernels are tuned for GB200/Blackwell. Use `ATTENTION_BACKEND=FA2` on H100 (set via env var before launch). The server defaults to TE if unset.
+
+**Recommendation:** Use **FA2 on H100**, **TE on GB200/Blackwell**.
+
 ### Performance Summary
 
-Measured on H100 PCIe (single GPU, no TensorRT) with DiT caching, dynamic cache scheduling, and `NUM_DIT_STEPS=5`:
+Measured on H100 PCIe (single GPU, no TensorRT) with FA2, DiT caching, dynamic cache scheduling, and `NUM_DIT_STEPS=5`:
 
 | Component | Time | Notes |
 |---|---|---|

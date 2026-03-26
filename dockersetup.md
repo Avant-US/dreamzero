@@ -62,6 +62,7 @@ docker run --gpus all -it --rm \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
+  -p 5000:5000 \
   -v ~/dreamzero:/workspace \
   -w /workspace \
   dreamzero
@@ -69,6 +70,7 @@ docker run --gpus all -it --rm \
 Notes:
 - `--ipc=host` -- required for PyTorch shared memory
 - `--ulimit` -- avoids memory issues
+- `-p 5000:5000` -- exposes the inference server port so clients can connect from the host
 - `-v ~/dreamzero:/workspace` -- mounts your code so edits on host reflect inside the container
 - Dependencies are baked into the image, so nothing is lost when the container exits
 
@@ -78,6 +80,7 @@ docker run --gpus all -it \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
+  -p 5000:5000 \
   -v ~/dreamzero:/workspace \
   -w /workspace \
   --name dreamzero-dev \
@@ -112,4 +115,19 @@ with te.fp8_autocast(enabled=True):
 
 print("Output shape:", y.shape)
 PY
+```
+
+## 8. Launch Inference Server
+
+Use `ATTENTION_BACKEND=FA2` on H100 for best performance (~2.8s vs ~4.5s with TE). TE's cuDNN attention kernels are optimized for GB200/Blackwell and are slower than FlashAttention2 on Hopper.
+
+```bash
+ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 \
+  torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
+  --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
+```
+
+Test from a second shell (or from the host if port is exposed):
+```bash
+docker exec -it dreamzero-dev python test_client_AR.py --port 5000
 ```
