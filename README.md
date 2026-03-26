@@ -133,13 +133,7 @@ hf download GEAR-Dreams/DreamZero-AgiBot --repo-type model --local-dir ./checkpo
 The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/DreamZero-AgiBot` by default. See the [new embodiment guide](docs/DATASET_TO_GEAR_AND_TRAIN.md) for usage.
 
 ## Running the Inference Server
-### Avantbot Specific
-```bash
-# Running the 14B parameter Model
-cd ~/dreamzero
-DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path    
-  ./huggingface_checkpoints  
-```
+
 ### Command Overview
 
 The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:
@@ -168,6 +162,39 @@ python test_client_AR.py --port 5000
 - `--max-chunk-size`: Override max_chunk_size for inference (optional)
 - `--timeout-seconds`: Server timeout in seconds (default: 50000)
 - `--index`: Index for output directory naming (default: 0)
+### Output
+
+The server saves:
+- **Videos**: Generated video predictions as MP4 files in `{model_path}/real_world_eval_gen_{date}_{index}/{checkpoint_name}/`
+- **Input observations**: Saved per message in `{output_dir}/inputs/{msg_index}_{timestamp}/`
+
+
+## Inference using Nvidia RTX Pro 6000 (Avant)
+
+The table below summarizes the inference optimizations from the dreamzero paper (Table 1) and their status running with the RTX6000 hardare. 
+#### Hardware Tested 
+Single NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB
+
+#### Additional Optimizations
+These are optimizations not in Table 1 that are active
+- `DYNAMIC_CACHE_SCHEDULE=true` — skipping redundant diffusion steps via cosine similarity
+- `NUM_DIT_STEPS=5` — reducing from 16 to 5 base steps
+
+| Paper Optimization | Speedup | Status | Bash Cmds |
+|---|---|---|---|
+| CFG Parallelism | 1.9x | MISSING — needs 2 GPUs, you have 1 | |
+| DiT Caching | 5.5x | ENABLED (`--enable-dit-cache`) | |
+| Torch Compile + CUDA Graphs | 8.9x | ENABLED (auto, but using FA2 fallback instead of TE) | |
+| Kernel & Scheduler Opts | 9.6x | PARTIAL — TE not installed, falling back to FA2 | (Total Inference: avg ~3.7s) <br> DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints  |
+| Quantization (NVFP4) | 16.6x | MISSING — TRT engine incompatible with your GPU | |
+| DreamZero-Flash | 38x | MISSING — requires specially trained checkpoint | |
+
+Both the Transformer Engine and TensorRT upgrades require system-level CUDA development headers (cudnn.h, nccl.h) that aren't installed on this machine. These are typically available in NVIDIA Docker containers or data center setups but not on workstation installs.
+ 
+Your current setup with FA2 + DiT caching + dynamic cache scheduling + reduced steps is already getting you ~3.7s per inference. The remaining optimizations (TE, TensorRT) would need either:                                                                                                                                                                                                         
+  1. Install CUDA dev headers: sudo apt-get install libcudnn9-dev-cuda-12 libnccl-dev — then rebuild                                                                                     
+  2. Use an NVIDIA container (like nvcr.io/nvidia/pytorch) which has everything pre-installed
+  3. Ask your team if they have a working Docker image from the GB200 setup   
 
 ### Performance Summary
 
@@ -185,11 +212,44 @@ Measured on RTX PRO 6000 Blackwell (single GPU, no TensorRT) with DiT caching, d
 
 For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The pre-built TensorRT engine is not compatible with the RTX PRO 6000 and must be rebuilt for that platform.
 
-### Output
+## Inference using Nvidia H100 (Avant)
 
-The server saves:
-- **Videos**: Generated video predictions as MP4 files in `{model_path}/real_world_eval_gen_{date}_{index}/{checkpoint_name}/`
-- **Input observations**: Saved per message in `{output_dir}/inputs/{msg_index}_{timestamp}/`
+The table below summarizes the inference optimizations from the dreamzero paper (Table 1) and their status running with the H100 hardware.
+#### Hardware Tested
+Single NVIDIA H100 PCIe, 81559 MiB
+
+#### Additional Optimizations
+These are optimizations not in Table 1 that are active
+- `DYNAMIC_CACHE_SCHEDULE=true` — skipping redundant diffusion steps via cosine similarity
+- `NUM_DIT_STEPS=5` — reducing from 16 to 5 base steps
+
+| Paper Optimization | Speedup | Status | Bash Cmds |
+|---|---|---|---|
+| CFG Parallelism | 1.9x | MISSING — needs 2 GPUs, you have 1 | |
+| DiT Caching | 5.5x | ENABLED (`--enable-dit-cache`) | |
+| Torch Compile + CUDA Graphs | 8.9x | ENABLED (auto, but using FA2 fallback instead of TE) | |
+| Kernel & Scheduler Opts | 9.6x | PARTIAL — TE not installed, falling back to FA2 | (Total Inference: avg ~2.8s) <br> DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints |
+| Quantization (NVFP4) | 16.6x | MISSING — TRT engine not built for this GPU | |
+| DreamZero-Flash | 38x | MISSING — requires specially trained checkpoint | |
+
+### Performance Summary
+
+Measured on H100 PCIe (single GPU, no TensorRT) with DiT caching, dynamic cache scheduling, and `NUM_DIT_STEPS=5`:
+
+| Component | Time | Notes |
+|---|---|---|
+| **Total inference** | **2.3 – 3.4s** (avg ~2.8s) | End-to-end per action chunk |
+| Warmup (1st call) | ~68s | Torch compile + cache initialization |
+| Warmup (2nd call) | ~56s | VAE compile + scheduling warmup |
+| Diffusion | 1.8 – 2.8s | Dominant bottleneck (~75% of total) |
+| DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (vs 16 baseline) |
+| KV Cache Creation | 0.25 – 0.54s | |
+| Image Encoder | 0.27s first call, 0.00s cached | |
+| Text Encoder | 0.03s | |
+| VAE | 0.00 – 0.07s | |
+
+For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The H100 PCIe with FA2 + DiT caching + dynamic scheduling achieves ~2.8s avg, slightly better than the paper's baseline H100 figure.
+
 
 
 ## Training
