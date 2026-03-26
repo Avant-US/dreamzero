@@ -58,7 +58,7 @@ This extends the NVIDIA PyTorch container (`nvcr.io/nvidia/pytorch:26.02-py3`) w
 
 ## 5. Run the Container
 ```bash
-sudo docker run --gpus all -it --rm \
+docker run --gpus all -it --rm \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
@@ -74,7 +74,7 @@ Notes:
 
 To keep the container around after exiting (instead of `--rm`):
 ```bash
-sudo docker run --gpus all -it \
+docker run --gpus all -it \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
