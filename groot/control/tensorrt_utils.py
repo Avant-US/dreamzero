@@ -102,7 +102,7 @@ def wan_trt_quantize_and_load_engine(
         print(f"Quantization type {cfg.quantize_dtype} not supported. Skipping quantization.")
 
     if quantization_config is not None and cfg.inference_mode == "trt_build":
-        #policy.trained_model.action_head.model.to(torch.float16)
+        policy.trained_model.action_head.model.to(torch.float16)
         wan_quantize(
             policy,
             quantization_config,
