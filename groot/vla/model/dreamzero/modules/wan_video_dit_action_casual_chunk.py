@@ -2201,6 +2201,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         start_frame: int,
     ):
         device = self.patch_embedding.weight.device
+        # If freqs are on meta device (e.g. from transformers meta-init), recreate them
+        if any(freq.device.type == "meta" for freq in self.freqs):
+            d = self.dim // self.num_heads
+            from groot.vla.model.dreamzero.modules.wan2_1_submodule import rope_params
+            self.freqs = [
+                rope_params(1024, d - 4 * (d // 6)).to(device),
+                rope_params(1024, 2 * (d // 6)).to(device),
+                rope_params(1024, 2 * (d // 6)).to(device),
+            ]
+            self.freqs_action = rope_params(1024*10, d).to(device)
+            self.freqs_state = rope_params(1024, d).to(device)
         if any(freq.device != device for freq in self.freqs):
             self.freqs = [freq.to(device) for freq in self.freqs]
         if self.freqs_action.device != device:
