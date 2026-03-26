@@ -290,8 +290,12 @@ def fused_attn(
     if _TE_VER >= (2, 8):
         args += (SoftmaxType[softmax_type],)
 
+    args += (tuple(window_size),)
+
+    if _TE_VER >= (2, 11):
+        args += (deterministic,)
+
     args += (
-        tuple(window_size),
         cu_seqlens_q,
         cu_seqlens_kv,
         q,
