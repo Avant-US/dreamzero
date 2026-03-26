@@ -292,7 +292,7 @@ def fused_attn(
 
     args += (tuple(window_size),)
 
-    if _TE_VER >= (2, 11):
+    if _TE_VER >= (2, 10):
         args += (deterministic,)
 
     args += (
