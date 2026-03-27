@@ -1962,7 +1962,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         x = self.patch_embedding(x)
-        grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
+        grid_size = torch.tensor(x.shape[2:], dtype=torch.long, device=x.device)
 
         freqs = self._create_freqs(
             grid_size=grid_size,
@@ -2041,7 +2041,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # embeddings
         x = self.patch_embedding(x)
 
-        grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
+        grid_size = torch.tensor(x.shape[2:], dtype=torch.long, device=x.device)
         freqs = self._create_freqs(
             grid_size=grid_size,
             start_frame=0,

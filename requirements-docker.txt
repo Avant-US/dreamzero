@@ -50,7 +50,10 @@ diffusers==0.30.2
 ftfy
 nvidia-modelopt
 nvidia-modelopt-core
+nvidia-modelopt[onnx]
 tensorrt
+onnx_graphsurgeon
+onnxslim
 openpi-client==0.1.1
 huggingface_hub
 decord2

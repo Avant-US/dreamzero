@@ -238,6 +238,7 @@ def export_to_onnx_ar_14B(pytorch_model, test_inputs, onnx_path="tensorrt/wan_mo
                 input_names=input_names,
                 output_names=output_names,
                 dynamic_axes=dynamic_axes,
+                dynamo=False,
             )
         print(f"  ONNX model exported to: {onnx_path}")
         return onnx_path
