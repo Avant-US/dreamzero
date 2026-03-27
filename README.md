@@ -442,7 +442,119 @@ Measured on 2x H100 80GB HBM3 (GCP) with FA2, DiT caching, dynamic cache schedul
 | **2x H100 (FA2 + CFG)** | **~1.0s** | **0.6 – 0.9s** | **2.6x** |
 | Paper (GB200 + TRT + NVFP4) | ~0.6s | — | — |
 
-The 2x H100 setup achieves ~1.0s without TRT, already close to the paper's 0.6s GB200 result. The remaining gap is TRT quantization (FP8/NVFP4), which is now viable with 160GB total VRAM across 2 GPUs. See the [TensorRT section above](#tensorrt-quantization-on-h100-nvfp4fp8) for build instructions.
+The 2x H100 setup achieves ~1.0s without TRT, already close to the paper's 0.6s GB200 result. TRT is not viable on H100 even with 2 GPUs — CFG parallelism replicates the full model per GPU, so each GPU still needs TRT + PyTorch DiT + KV cache > 80GB. See the [TensorRT section above](#tensorrt-quantization-on-h100-nvfp4fp8) for details.
+
+## Inference using Double Nvidia H200 (Avant)
+
+The H200 has 141GB HBM3e per GPU (vs H100's 80GB), providing enough memory for TRT + PyTorch DiT + KV cache to coexist on each GPU. This enables TensorRT FP8 quantization with CFG parallelism.
+
+#### Hardware Tested
+2x NVIDIA H200 141GB HBM3e (GCP, 8x H200 node, using 2 GPUs)
+
+#### Setup (Docker)
+
+1. **Install Docker + NVIDIA Container Toolkit** (if not already):
+```bash
+sudo apt-get update && sudo apt-get install -y docker.io
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+sudo bash -c 'echo "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/\$(ARCH) /" > /etc/apt/sources.list.d/nvidia-container-toolkit.list'
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+2. **Clone and build:**
+```bash
+git clone --recurse-submodules https://github.com/Avant-US/dreamzero.git
+cd dreamzero
+docker build -t dreamzero .
+```
+
+3. **Run container with 2 GPUs:**
+```bash
+mkdir -p /dev/shm/huggingface_cache
+docker run --gpus '"device=0,1"' -it --rm \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  -p 5000:5000 \
+  -v $(pwd):/workspace \
+  -v /dev/shm/huggingface_cache:/root/.cache/huggingface \
+  -w /workspace \
+  dreamzero
+```
+Note: HF cache is mounted to `/dev/shm` (RAM-backed tmpfs, ~1.5TB available). Fast but lost on reboot.
+
+4. **Inside the container — download checkpoint and run:**
+```bash
+pip install --no-deps -e .
+
+# Download checkpoint (~45GB, saves to RAM-backed cache)
+python -c "from huggingface_hub import snapshot_download; snapshot_download('GEAR-Dreams/DreamZero-DROID', local_dir='/root/.cache/huggingface/dreamzero-checkpoints')"
+
+# Run 2-GPU inference with FA2 + CFG parallelism
+ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true \
+  CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  socket_test_optimized_AR.py --port 5000 --enable-dit-cache \
+  --model-path /root/.cache/huggingface/dreamzero-checkpoints
+```
+
+5. **Test from a second shell:**
+```bash
+docker exec -it $(docker ps -q) python test_client_AR.py --port 5000
+```
+
+6. **(Optional) Build and run with TRT FP8 for maximum speed:**
+```bash
+# Install ONNX deps
+pip install onnxconverter-common onnx onnxruntime onnxslim numpy==1.26.4
+pip install onnx_graphsurgeon --extra-index-url https://pypi.ngc.nvidia.com
+
+# Build FP8 engine (~10-15 min)
+bash scripts/inference/build_trt_engine.sh \
+    --model-path /root/.cache/huggingface/dreamzero-checkpoints \
+    --tensorrt fp8 --cuda-device 0
+
+# Run with TRT + CFG parallelism
+LOAD_TRT_ENGINE=/root/.cache/huggingface/dreamzero-checkpoints/tensorrt/wan/WanModel_fp8.trt \
+  DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0,1 \
+  torchrun --standalone --nproc_per_node=2 socket_test_optimized_AR.py \
+  --port 5000 --enable-dit-cache \
+  --model-path /root/.cache/huggingface/dreamzero-checkpoints
+```
+
+### Performance Summary (FA2 + CFG, no TRT)
+
+Measured on 2x H200 141GB HBM3e (GCP) with FA2, DiT caching, dynamic cache scheduling, and CFG parallelism:
+
+**Table 10: 2x H200 FA2 inference breakdown**
+
+| Component | Time | Notes |
+|---|---|---|
+| **Total inference** | **0.85 – 1.15s** (avg ~0.93s) | End-to-end per action chunk |
+| Warmup (1st call) | ~90s | Torch compile + cache initialization |
+| Warmup (2nd call) | ~17s | VAE compile + scheduling warmup |
+| Diffusion | 0.58 – 0.88s | CFG parallelism splits across 2 GPUs |
+| DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (from 16 base) |
+| KV Cache Creation | 0.09 – 0.18s | |
+| Image Encoder | 0.18-0.24s first call, 0.00s cached | |
+| Text Encoder | 0.01s | |
+| VAE | 0.00 – 0.05s | |
+
+### Performance Summary (TRT FP8 + CFG) — Pending
+
+TRT FP8 engine build and benchmarks in progress. With 141GB per GPU, TRT + PyTorch DiT should coexist without OOM. Expected ~0.5s per inference.
+
+**Table 11: All hardware comparison**
+
+| Setup | Avg Inference | Diffusion | VRAM/GPU |
+|---|---|---|---|
+| Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 80GB |
+| 2x H100 (FA2 + CFG) | ~1.0s | 0.6 – 0.9s | 80GB |
+| 2x H100 (TRT + CFG) | OOM | — | 80GB (insufficient) |
+| **2x H200 (FA2 + CFG)** | **~0.93s** | **0.58 – 0.88s** | **141GB** |
+| 2x H200 (TRT + CFG) | ~0.5s (expected) | ~0.3s (expected) | 141GB |
+| Paper (GB200 + TRT + NVFP4) | ~0.6s | — | 192GB |
 
 
 ## Training
