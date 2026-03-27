@@ -224,8 +224,7 @@ Single NVIDIA H100 PCIe, 81559 MiB
 
 #### Additional Optimizations
 These are optimizations not in Table 1 that are active
-- `DYNAMIC_CACHE_SCHEDULE=true` — skipping redundant diffusion steps via cosine similarity
-- `NUM_DIT_STEPS=5` — reducing from 16 to 5 base steps
+- `DYNAMIC_CACHE_SCHEDULE=true` — skipping redundant diffusion steps via cosine similarity (default 16 base steps, dynamic cache reduces to 4-5 effective steps)
 
 **Table 3: H100 optimization status vs paper**
 
@@ -234,7 +233,7 @@ These are optimizations not in Table 1 that are active
 | CFG Parallelism | 1.9x | MISSING — needs 2 GPUs, you have 1 | |
 | DiT Caching | 5.5x | ENABLED (`--enable-dit-cache`) | |
 | Torch Compile + CUDA Graphs | 8.9x | ENABLED (auto, but using FA2 fallback instead of TE) | |
-| Kernel & Scheduler Opts | 9.6x | FA2 recommended over TE on H100 (see below) | (Total Inference: avg ~2.8s) <br> ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints |
+| Kernel & Scheduler Opts | 9.6x | FA2 recommended over TE on H100 (see below) | (Total Inference: avg ~2.6s) <br> ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints |
 | Quantization (NVFP4/FP8) | 16.6x | NOT VIABLE on single 80GB GPU (see below) | |
 | DreamZero-Flash | 38x | MISSING — requires specially trained checkpoint | |
 
@@ -246,7 +245,7 @@ The paper benchmarks TE (cuDNN fused attention) as faster than FA2 (Table 1: 9.6
 
 | Attention Backend | Avg Inference | Diffusion Time | Notes |
 |---|---|---|---|
-| **FA2 (FlashAttention2)** | **~2.8s** | 1.8 – 2.8s | Recommended for H100 |
+| **FA2 (FlashAttention2)** | **~2.6s** | 1.7 – 2.6s | Recommended for H100 |
 | TE (cuDNN fused attn) | ~4.5s | 3.0 – 4.4s | ~60% slower on H100 |
 
 FA2 is extremely well-optimized for H100/Hopper, while TE's cuDNN attention kernels are tuned for GB200/Blackwell. Use `ATTENTION_BACKEND=FA2` on H100 (set via env var before launch). The server defaults to TE if unset.
@@ -259,7 +258,7 @@ We attempted to build and run TensorRT engines with FP8 quantization on a single
 
 **What works:**
 - FP8 TRT engine builds successfully (15.5GB engine file)
-- Diffusion inference via TRT: ~0.85s per step (vs ~2.8s with PyTorch FA2)
+- Diffusion inference via TRT: ~0.85s per step (vs ~2.6s with PyTorch FA2)
 - First 1-2 inference calls complete
 
 **What fails:**
@@ -286,7 +285,7 @@ bash scripts/inference/build_trt_engine.sh \
 
 # Run inference with TRT (will OOM after 2-3 calls on single 80GB GPU)
 LOAD_TRT_ENGINE=./huggingface_checkpoints/tensorrt/wan/WanModel_fp8.trt \
-    DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 \
+    DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0 \
     torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
     --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
 ```
@@ -295,23 +294,25 @@ LOAD_TRT_ENGINE=./huggingface_checkpoints/tensorrt/wan/WanModel_fp8.trt \
 
 ### Performance Summary
 
-Measured on H100 PCIe (single GPU, no TensorRT) with FA2, DiT caching, dynamic cache scheduling, and `NUM_DIT_STEPS=5`:
+Measured on H100 PCIe (single GPU, no TensorRT) with FA2, DiT caching, and dynamic cache scheduling (default 16 base steps):
 
 **Table 5: H100 inference breakdown**
 
 | Component | Time | Notes |
 |---|---|---|
-| **Total inference** | **2.3 – 3.4s** (avg ~2.8s) | End-to-end per action chunk |
-| Warmup (1st call) | ~68s | Torch compile + cache initialization |
-| Warmup (2nd call) | ~56s | VAE compile + scheduling warmup |
-| Diffusion | 1.8 – 2.8s | Dominant bottleneck (~75% of total) |
-| DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (vs 16 baseline) |
-| KV Cache Creation | 0.25 – 0.54s | |
-| Image Encoder | 0.27s first call, 0.00s cached | |
+| **Total inference** | **2.3 – 3.1s** (avg ~2.6s) | End-to-end per action chunk |
+| Warmup (1st call) | ~13s | Torch compile + cache initialization |
+| Warmup (2nd call) | ~4s | VAE compile + scheduling warmup |
+| Diffusion | 1.7 – 2.6s | Dominant bottleneck (~75% of total) |
+| DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (from 16 base) |
+| KV Cache Creation | 0.25 – 0.53s | |
+| Image Encoder | 0.30s first call, 0.00s cached | |
 | Text Encoder | 0.03s | |
-| VAE | 0.00 – 0.07s | |
+| VAE | 0.00 – 0.08s | |
 
-For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The H100 PCIe with FA2 + DiT caching + dynamic scheduling achieves ~2.8s avg, slightly better than the paper's baseline H100 figure.
+Note: Using `NUM_DIT_STEPS=5` (explicit 5 base steps) is slightly slower (~2.8s avg) because the dynamic cache has fewer steps to evaluate and skip. Letting the default 16 base steps run with `DYNAMIC_CACHE_SCHEDULE=true` gives the cache more room to optimize, landing at 4-5 effective steps with better skip decisions.
+
+For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The H100 PCIe with FA2 + DiT caching + dynamic scheduling achieves ~2.6s avg, better than the paper's baseline H100 figure.
 
 ### Analysis: Our Results vs Paper's Table 1
 
@@ -327,15 +328,15 @@ The paper reports a 5.7s baseline on a single GPU and claims cumulative speedups
 | + Torch Compile + CUDA Graphs | 8.9x | 0.64s |
 | + Kernel & Scheduler Opts | 9.6x | 0.59s |
 
-**Our setup:** Single H100 PCIe, FA2, DiT caching, dynamic cache scheduling, `NUM_DIT_STEPS=5` → **~2.8s avg**
+**Our setup:** Single H100 PCIe, FA2, DiT caching, dynamic cache scheduling → **~2.6s avg**
 
-Despite having DiT caching, torch compile, and CUDA graphs all enabled, we see ~2.8s rather than the sub-1s the table might suggest. The key reasons:
+Despite having DiT caching, torch compile, and CUDA graphs all enabled, we see ~2.6s rather than the sub-1s the table might suggest. The key reasons:
 
 1. **CFG Parallelism requires 2 GPUs (missing ~1.9x).** Table 1 is cumulative — every row after CFG Parallelism assumes 2 GPUs are already in use. Without a second GPU, the conditional and unconditional CFG passes run sequentially, so every diffusion step takes ~2x longer than what the paper assumes. This single factor accounts for most of the gap.
 
 2. **H100 PCIe vs SXM.** The paper almost certainly benchmarked on H100 SXM, which has higher memory bandwidth (3.35 TB/s vs 2.0 TB/s) and TDP. PCIe variants are ~20-30% slower for memory-bound workloads like diffusion.
 
-3. **`NUM_DIT_STEPS=5` interacts with DiT caching.** The paper's DiT caching reduces effective steps from 16 to ~4 via cosine similarity skipping (a large multiplier). With `NUM_DIT_STEPS=5`, our dynamic cache has fewer steps to skip, so the caching benefit is smaller — we may be computing nearly all 5 steps rather than skipping 75% of 16.
+3. **DiT caching effectiveness.** The dynamic cache reduces 16 base steps to 4-5 effective steps via cosine similarity skipping. This is a large multiplier but doesn't reach the paper's ideal because the paper's benchmarks assume CFG parallelism is already active.
 
 **Table 7: Adjusted expectations for single H100 PCIe**
 
@@ -344,15 +345,15 @@ Despite having DiT caching, torch compile, and CUDA graphs all enabled, we see ~
 | Baseline (1 GPU, no opts) | 1x | 5.7s | — |
 | + DiT Caching  | 5.5x / 1.9x = 2.9x | ~1.9s | — |
 | + Torch Compile + CUDA Graphs | 8.9x / 1.9x = 4.7x | ~1.2s | — |
-| + FA2 (instead of TE kernel opts) | 9.6x / 1.9x = 5.1x | ~1.1s | **~2.8s** |
+| + FA2 (instead of TE kernel opts) | 9.6x / 1.9x = 5.1x | ~1.1s | **~2.6s** |
 
-The remaining gap between ~1.1s expected and ~2.8s actual is likely the PCIe bandwidth penalty plus reduced caching effectiveness with fewer base steps.
+The remaining gap between ~1.1s expected and ~2.6s actual is likely the PCIe bandwidth penalty (vs SXM).
 
 **To get closer to the paper's performance:**
-1. **Add a second GPU** for CFG parallelism — expected ~1.9x improvement (bringing ~2.8s → ~1.5s)
+1. **Add a second GPU** for CFG parallelism — expected ~1.9x improvement (bringing ~2.6s → ~1.4s)
 2. **Use H100 SXM** instead of PCIe — expected ~20-30% gain on top of that
 
-**Bottom line:** Our ~2.8s on a single H100 PCIe is reasonable given the constraints. The paper's sub-1s H100 numbers assume 2x SXM GPUs with CFG parallelism active.
+**Bottom line:** Our ~2.6s on a single H100 PCIe is reasonable given the constraints. The paper's sub-1s H100 numbers assume 2x SXM GPUs with CFG parallelism active.
 
 
 

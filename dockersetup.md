@@ -126,10 +126,10 @@ pip install --no-deps -e .
 
 ## 9. Launch Inference Server
 
-Use `ATTENTION_BACKEND=FA2` on H100 for best performance (~2.8s vs ~4.5s with TE). TE's cuDNN attention kernels are optimized for GB200/Blackwell and are slower than FlashAttention2 on Hopper.
+Use `ATTENTION_BACKEND=FA2` on H100 for best performance (~2.6s vs ~4.5s with TE). TE's cuDNN attention kernels are optimized for GB200/Blackwell and are slower than FlashAttention2 on Hopper. Dynamic cache scheduling with default 16 base steps is slightly faster than explicitly setting `NUM_DIT_STEPS=5`.
 
 ```bash
-ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 \
+ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0 \
   torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
   --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
 ```
@@ -141,7 +141,7 @@ docker exec -it dreamzero-dev python test_client_AR.py --port 5000
 
 ## 10. (Optional) Build TensorRT FP8 Engine
 
-TensorRT quantization reduces diffusion time from ~2.8s to ~0.85s, but on a single 80GB H100 it OOMs after 2-3 inference calls because the TRT engine (15.5GB) + PyTorch DiT (~28GB, needed for KV cache) + KV cache exceeds 80GB. This optimization is only viable with 2+ GPUs. See the README for full details.
+TensorRT quantization reduces diffusion time from ~2.6s to ~0.85s, but on a single 80GB H100 it OOMs after 2-3 inference calls because the TRT engine (15.5GB) + PyTorch DiT (~28GB, needed for KV cache) + KV cache exceeds 80GB. This optimization is only viable with 2+ GPUs. See the README for full details.
 
 To build the engine anyway (useful for benchmarking or multi-GPU setups):
 ```bash
@@ -158,7 +158,7 @@ bash scripts/inference/build_trt_engine.sh \
 
 # Run with TRT engine
 LOAD_TRT_ENGINE=./huggingface_checkpoints/tensorrt/wan/WanModel_fp8.trt \
-  DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 \
+  DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0 \
   torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
   --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
 ```
