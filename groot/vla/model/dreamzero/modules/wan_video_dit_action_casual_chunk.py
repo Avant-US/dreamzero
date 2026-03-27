@@ -1181,7 +1181,7 @@ class CausalWanAttentionBlock(nn.Module):
                 aligned.append(part[:, :L])
             else:
                 repeat = (L + L_e - 1) // L_e
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :L])
+                aligned.append(part.repeat(1, repeat, 1)[:, :L])
         e = tuple(aligned)
 
         # self-attention
@@ -1245,7 +1245,7 @@ class CausalHead(nn.Module):
                 aligned.append(part[:, :L])
             else:
                 repeat = (L + L_e - 1) // L_e
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :L])
+                aligned.append(part.repeat(1, repeat, 1)[:, :L])
         e = tuple(aligned)
         x = (self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
         return x
@@ -1768,7 +1768,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # time embeddings: expand to exactly seq_len so e matches x (5B: frame_seqlen=50, 1 frame -> 50 tokens)
         if F <= seq_len:
             repeat = (seq_len + F - 1) // F
-            timestep = timestep.repeat_interleave(repeat, dim=1)[:, :seq_len]
+            timestep = timestep.repeat(1, repeat)[:, :seq_len]
         else:
             indices = torch.linspace(0, F - 1, seq_len, device=timestep.device, dtype=torch.long)
             timestep = timestep[:, indices]
