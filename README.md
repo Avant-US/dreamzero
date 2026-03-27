@@ -254,7 +254,7 @@ FA2 is extremely well-optimized for H100/Hopper, while TE's cuDNN attention kern
 
 ### TensorRT Quantization on H100 (NVFP4/FP8)
 
-We attempted to build and run TensorRT engines with FP8 quantization on a single H100 PCIe (80GB). The engine builds successfully and the diffusion step drops from ~2.8s to ~0.85s, but **the engine cannot run reliably due to GPU memory constraints**.
+We attempted to build and run TensorRT engines with FP8 quantization on H100 GPUs (80GB each). The engine builds successfully and the diffusion step drops from ~2.6s to ~0.3-0.5s, but **the engine cannot run reliably due to GPU memory constraints — even with 2 GPUs**.
 
 **What works:**
 - FP8 TRT engine builds successfully (15.5GB engine file)
@@ -266,8 +266,10 @@ We attempted to build and run TensorRT engines with FP8 quantization on a single
 - The TRT engine (15.5GB runtime) + PyTorch DiT (~28GB, needed for KV cache creation) + KV cache + other models exceeds 80GB
 - The TRT engine only handles the diffusion-only path; KV cache creation still requires the full PyTorch DiT model on GPU
 
-**Why this is a GB200-only optimization:**
-The paper's TRT results were measured on GB200 with 2 GPUs (~192GB total VRAM) and CFG parallelism. On a single 80GB H100, both the TRT engine and PyTorch DiT cannot coexist in memory. NVFP4 has the same issue (even smaller engine, but the PyTorch DiT is still ~28GB).
+**Why this doesn't work even with 2x H100:**
+CFG parallelism **replicates** the full model on each GPU (not splits it), so each GPU needs: TRT engine (15.5GB) + PyTorch DiT (~28GB for KV cache creation) + KV cache + other models = ~75GB+. As KV cache grows, it exceeds 80GB per GPU. The paper's GB200 likely had more per-GPU memory (96GB+) or a different KV cache strategy.
+
+**Recommendation:** Use **FA2 + CFG parallelism** (~1.0s on 2x H100) for production. TRT on H100 is only useful as a benchmark for the diffusion step in isolation.
 
 **To build and test the FP8 TRT engine yourself (Docker required):**
 ```bash

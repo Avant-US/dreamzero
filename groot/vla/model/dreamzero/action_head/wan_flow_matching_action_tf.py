@@ -882,6 +882,10 @@ class WANPolicyHead(ActionHead):
                     kv_cache=kv_cache,
                 )
             else:
+                # If TRT is loaded, PyTorch DiT lives on CPU — move to GPU for KV cache updates
+                _model_offloaded = self.trt_engine is not None and not next(self.model.parameters()).is_cuda
+                if _model_offloaded:
+                    self.model.to(device=noisy_input.device, dtype=torch.bfloat16)
                 obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
                     noisy_input,
                     timestep,
@@ -900,6 +904,9 @@ class WANPolicyHead(ActionHead):
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
                         kv_cache[block_index] = updated_kv_cache.clone()
+                if _model_offloaded:
+                    self.model.cpu()
+                    torch.cuda.empty_cache()
             obs_noise_pred = obs_noise_pred.clone()
             if action_noise_pred is not None:
                 action_noise_pred = action_noise_pred.clone()
@@ -1379,6 +1386,11 @@ class WANPolicyHead(ActionHead):
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
             print(f"Loading TRT engine from {LOAD_TRT_ENGINE}")
+            # Offload PyTorch DiT to CPU to make room for TRT engine.
+            # KV cache creation will move it back temporarily (slow on single GPU,
+            # but TRT on H100 is only viable as a benchmark — use FA2+CFG for production).
+            self.model.cpu()
+            torch.cuda.empty_cache()
             import groot.control.tensorrt_utils as trt_utils
             model_path = LOAD_TRT_ENGINE
             self.trt_engine = trt_utils.load_tensorrt_engine(model_path, model_type="ar_14B")
