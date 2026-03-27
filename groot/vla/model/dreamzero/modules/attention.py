@@ -95,7 +95,7 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert q.size(-1) <= 256
 
     # Use PyTorch SDPA on pre-Ampere GPUs (FlashAttention requires Ampere or newer)
     if not _gpu_supports_flash_attention():

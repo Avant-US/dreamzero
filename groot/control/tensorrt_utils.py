@@ -227,6 +227,11 @@ def export_to_onnx_ar_14B(pytorch_model, test_inputs, onnx_path="tensorrt/wan_mo
     output_names = ["video_noise_pred", "action_noise_pred"]
 
     try:
+        # Move model and inputs to CPU to avoid GPU OOM during ONNX constant folding
+        pytorch_model.cpu()
+        test_inputs = tuple(t.cpu() if isinstance(t, torch.Tensor) else t for t in test_inputs)
+        torch.cuda.empty_cache()
+
         with torch.no_grad():
             torch.onnx.export(
                 pytorch_model,
