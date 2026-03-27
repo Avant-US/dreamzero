@@ -216,7 +216,7 @@ Measured on RTX PRO 6000 Blackwell (single GPU, no TensorRT) with DiT caching, d
 
 For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The pre-built TensorRT engine is not compatible with the RTX PRO 6000 and must be rebuilt for that platform.
 
-## Inference using Nvidia H100 (Avant)
+## Inference using Single Nvidia H100 (Avant)
 
 The table below summarizes the inference optimizations from the dreamzero paper (Table 1) and their status running with the H100 hardware.
 #### Hardware Tested
@@ -355,6 +355,92 @@ The remaining gap between ~1.1s expected and ~2.6s actual is likely the PCIe ban
 
 **Bottom line:** Our ~2.6s on a single H100 PCIe is reasonable given the constraints. The paper's sub-1s H100 numbers assume 2x SXM GPUs with CFG parallelism active.
 
+## Inference using Double Nvidia H100 (Avant)
+
+With 2x H100 GPUs, CFG parallelism is enabled — the conditional and unconditional diffusion passes run in parallel across GPUs, cutting diffusion time roughly in half.
+
+#### Hardware Tested
+2x NVIDIA H100 80GB HBM3 (GCP a3-highgpu, 8x H100 node, using 2 GPUs)
+
+#### Setup (Docker)
+
+1. **Install Docker + NVIDIA Container Toolkit** (if not already):
+```bash
+sudo apt-get install -y docker.io
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+sudo bash -c 'echo "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/\$(ARCH) /" > /etc/apt/sources.list.d/nvidia-container-toolkit.list'
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+2. **Build the Docker image** (requires `.dockerignore` to exclude checkpoints):
+```bash
+cd ~/dreamzero
+sudo docker build -t dreamzero .
+```
+
+3. **Download checkpoint** (if not already present):
+```bash
+python -c "from huggingface_hub import snapshot_download; snapshot_download('GEAR-Dreams/DreamZero-DROID', local_dir='./huggingface_checkpoints')"
+```
+
+4. **Run container with 2 GPUs** (adjust device IDs as needed):
+```bash
+sudo docker run --gpus '"device=6,7"' -it --rm \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  -p 5000:5000 \
+  -v ~/dreamzero:/workspace \
+  -v /mnt/localssd/huggingface_cache:/root/.cache/huggingface \
+  -w /workspace \
+  dreamzero
+```
+Note: Mount the HF cache to a disk with sufficient space (~30GB for Wan2.1 base model auto-download).
+
+5. **Inside the container — launch 2-GPU inference:**
+```bash
+pip install --no-deps -e .
+ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true \
+  CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  socket_test_optimized_AR.py --port 5000 --enable-dit-cache \
+  --model-path ./huggingface_checkpoints
+```
+Note: `CUDA_VISIBLE_DEVICES=0,1` inside the container because Docker's `--gpus "device=6,7"` maps host GPUs 6,7 to container GPUs 0,1.
+
+6. **Test from a second shell:**
+```bash
+sudo docker exec -it $(sudo docker ps -q) python test_client_AR.py --port 5000
+```
+
+### Performance Summary
+
+Measured on 2x H100 80GB HBM3 (GCP) with FA2, DiT caching, dynamic cache scheduling, and CFG parallelism:
+
+**Table 8: 2x H100 inference breakdown**
+
+| Component | Time | Notes |
+|---|---|---|
+| **Total inference** | **0.91 – 1.23s** (avg ~1.0s) | End-to-end per action chunk |
+| Warmup (1st call) | ~98s | Torch compile + cache initialization |
+| Warmup (2nd call) | ~19s | VAE compile + scheduling warmup |
+| Diffusion | 0.62 – 0.93s | CFG parallelism splits across 2 GPUs |
+| DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (from 16 base) |
+| KV Cache Creation | 0.10 – 0.19s | |
+| Image Encoder | 0.20s first call, 0.00s cached | |
+| Text Encoder | 0.01s | |
+| VAE | 0.00 – 0.05s | |
+
+**Table 9: Single vs Double H100 comparison**
+
+| Setup | Avg Inference | Diffusion | Speedup |
+|---|---|---|---|
+| Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 1x |
+| **2x H100 (FA2 + CFG)** | **~1.0s** | **0.6 – 0.9s** | **2.6x** |
+| Paper (GB200 + TRT + NVFP4) | ~0.6s | — | — |
+
+The 2x H100 setup achieves ~1.0s without TRT, already close to the paper's 0.6s GB200 result. The remaining gap is TRT quantization (FP8/NVFP4), which is now viable with 160GB total VRAM across 2 GPUs. See the [TensorRT section above](#tensorrt-quantization-on-h100-nvfp4fp8) for build instructions.
 
 
 ## Training
