@@ -235,7 +235,7 @@ These are optimizations not in Table 1 that are active
 | DiT Caching | 5.5x | ENABLED (`--enable-dit-cache`) | |
 | Torch Compile + CUDA Graphs | 8.9x | ENABLED (auto, but using FA2 fallback instead of TE) | |
 | Kernel & Scheduler Opts | 9.6x | FA2 recommended over TE on H100 (see below) | (Total Inference: avg ~2.8s) <br> ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints |
-| Quantization (NVFP4) | 16.6x | MISSING — TRT engine not built for this GPU | |
+| Quantization (NVFP4/FP8) | 16.6x | NOT VIABLE on single 80GB GPU (see below) | |
 | DreamZero-Flash | 38x | MISSING — requires specially trained checkpoint | |
 
 ### FA2 vs Transformer Engine on H100
@@ -252,6 +252,46 @@ The paper benchmarks TE (cuDNN fused attention) as faster than FA2 (Table 1: 9.6
 FA2 is extremely well-optimized for H100/Hopper, while TE's cuDNN attention kernels are tuned for GB200/Blackwell. Use `ATTENTION_BACKEND=FA2` on H100 (set via env var before launch). The server defaults to TE if unset.
 
 **Recommendation:** Use **FA2 on H100**, **TE on GB200/Blackwell**.
+
+### TensorRT Quantization on H100 (NVFP4/FP8)
+
+We attempted to build and run TensorRT engines with FP8 quantization on a single H100 PCIe (80GB). The engine builds successfully and the diffusion step drops from ~2.8s to ~0.85s, but **the engine cannot run reliably due to GPU memory constraints**.
+
+**What works:**
+- FP8 TRT engine builds successfully (15.5GB engine file)
+- Diffusion inference via TRT: ~0.85s per step (vs ~2.8s with PyTorch FA2)
+- First 1-2 inference calls complete
+
+**What fails:**
+- OOM on the 3rd+ inference call as KV cache accumulates
+- The TRT engine (15.5GB runtime) + PyTorch DiT (~28GB, needed for KV cache creation) + KV cache + other models exceeds 80GB
+- The TRT engine only handles the diffusion-only path; KV cache creation still requires the full PyTorch DiT model on GPU
+
+**Why this is a GB200-only optimization:**
+The paper's TRT results were measured on GB200 with 2 GPUs (~192GB total VRAM) and CFG parallelism. On a single 80GB H100, both the TRT engine and PyTorch DiT cannot coexist in memory. NVFP4 has the same issue (even smaller engine, but the PyTorch DiT is still ~28GB).
+
+**To build and test the FP8 TRT engine yourself (Docker required):**
+```bash
+# Install ONNX export dependencies (inside the Docker container)
+pip install --no-deps -e .
+pip install onnxconverter-common onnx onnxruntime onnxslim
+pip install onnx_graphsurgeon --extra-index-url https://pypi.ngc.nvidia.com
+pip install numpy==1.26.4
+
+# Build the FP8 engine (~10-15 min)
+bash scripts/inference/build_trt_engine.sh \
+    --model-path ./huggingface_checkpoints \
+    --tensorrt fp8 \
+    --cuda-device 0
+
+# Run inference with TRT (will OOM after 2-3 calls on single 80GB GPU)
+LOAD_TRT_ENGINE=./huggingface_checkpoints/tensorrt/wan/WanModel_fp8.trt \
+    DYNAMIC_CACHE_SCHEDULE=true NUM_DIT_STEPS=5 CUDA_VISIBLE_DEVICES=0 \
+    torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
+    --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
+```
+
+**To make TRT viable on H100:** Add a second GPU for CFG parallelism, which splits the memory load and is how the paper achieved ~0.6s on GB200.
 
 ### Performance Summary
 
