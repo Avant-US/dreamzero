@@ -372,12 +372,11 @@ def build_tensorrt_engine(onnx_path, engine_path="tensorrt/wan_model.trt", min_s
         parser = trt.OnnxParser(network, TRT_LOGGER)
 
         print(f"  Parsing ONNX model: {onnx_path}")
-        onnx_dir = os.path.dirname(os.path.abspath(onnx_path))
-        with open(onnx_path, "rb") as f:
-            if not parser.parse(f.read(), path=onnx_dir):
-                for i in range(parser.num_errors):
-                    print(f"  ONNX Parse Error: {parser.get_error(i)}")
-                return None
+        onnx_abs_path = os.path.abspath(onnx_path)
+        if not parser.parse_from_file(onnx_abs_path):
+            for i in range(parser.num_errors):
+                print(f"  ONNX Parse Error: {parser.get_error(i)}")
+            return None
         print(f"  ONNX parsed successfully: {network.num_inputs} inputs, {network.num_outputs} outputs")
 
         config = builder.create_builder_config()
