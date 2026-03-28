@@ -19,7 +19,7 @@ DreamZero is a World Action Model that jointly predicts actions and videos, achi
 - Pretrained DreamZero-DROID model checkpoint [[Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-DROID)]
 - Pretrained DreamZero-AgiBot checkpoint (for post-training on new embodiments) [[Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot)]
 - Distributed WebSocket inference server (GB200, H100)
-- DiT caching for optimized inference (~0.6s on GB200, ~3s on H100)
+- DiT caching for optimized inference (~0.34s on GB200 with NVFP4, ~0.6s on 2x H100)
 - DROID simulation evaluation support
 - [RoboArena](https://robo-arena.github.io/) integration (DROID real)
 - Video generation and saving (MP4)
@@ -148,7 +148,7 @@ export LOAD_TRT_ENGINE=<path/to/checkpoint>/tensorrt/wan/WanModel_nvfp4.trt
 export DYNAMIC_CACHE_SCHEDULE=true 
 CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 /mnt/aws-lfs-02/shared/seonghyeony/dreamzero/socket_test_optimized_AR.py --port 8000 --enable-dit-cache --model-path <path/to/checkpoint>
 ```
-To verify the server is working, run a test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.6s on GB200 and ~3s on H100.
+To verify the server is working, run a test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.34s on GB200 (with TRT + NVFP4) and ~0.6s on H100 (with all optimizations from Table 1).
 
 ```
 python test_client_AR.py --port 5000
@@ -214,7 +214,7 @@ Measured on RTX PRO 6000 Blackwell (single GPU, no TensorRT) with DiT caching, d
 | Text Encoder | 0.05s | |
 | VAE | 0.00 – 0.10s | |
 
-For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The pre-built TensorRT engine is not compatible with the RTX PRO 6000 and must be rebuilt for that platform.
+For reference, the paper's Table 1 reports ~0.6s on H100 (9.6x speedup, without quantization) and ~0.34s on GB200 (16.6x, with NVFP4). The pre-built TensorRT engine is not compatible with the RTX PRO 6000 and must be rebuilt for that platform.
 
 ## Inference using Single Nvidia H100 (Avant)
 
@@ -292,7 +292,7 @@ LOAD_TRT_ENGINE=./huggingface_checkpoints/tensorrt/wan/WanModel_fp8.trt \
     --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
 ```
 
-**To make TRT viable on H100:** Add a second GPU for CFG parallelism, which splits the memory load and is how the paper achieved ~0.6s on GB200.
+**To make TRT viable on H100:** Add a second GPU for CFG parallelism, which splits the memory load and is how the paper achieved ~0.34s on GB200 (16.6x with NVFP4).
 
 ### Performance Summary
 
@@ -314,21 +314,23 @@ Measured on H100 PCIe (single GPU, no TensorRT) with FA2, DiT caching, and dynam
 
 Note: Using `NUM_DIT_STEPS=5` (explicit 5 base steps) is slightly slower (~2.8s avg) because the dynamic cache has fewer steps to evaluate and skip. Letting the default 16 base steps run with `DYNAMIC_CACHE_SCHEDULE=true` gives the cache more room to optimize, landing at 4-5 effective steps with better skip decisions.
 
-For reference, the paper reports ~0.6s on GB200 (with TensorRT + NVFP4) and ~3s on H100. The H100 PCIe with FA2 + DiT caching + dynamic scheduling achieves ~2.6s avg, better than the paper's baseline H100 figure.
+For reference, the paper's Table 1 reports ~0.6s on H100 (9.6x, without quantization) and ~0.34s on GB200 (16.6x, with NVFP4). The H100 PCIe with FA2 + DiT caching + dynamic scheduling achieves ~2.6s avg, better than the paper's baseline single-GPU H100 figure (~3s).
 
 ### Analysis: Our Results vs Paper's Table 1
 
-The paper reports a 5.7s baseline on a single GPU and claims cumulative speedups up to 9.6x on H100 (sub-0.6s). Here's how those claims map to implied latency:
+The paper reports a 5.7s baseline on a single GPU and claims cumulative speedups up to 9.6x on H100 and 16.6x on GB200 (with NVFP4). Here's how those claims map to implied latency:
 
 **Table 6: Paper's Table 1 cumulative speedups (starting from 5.7s baseline)**
 
-| Optimization | H100 Speedup | Implied Time |
-|---|---|---|
-| Baseline (single GPU) | 1x | 5.7s |
-| + CFG Parallelism (2 GPUs) | 1.9x | 3.0s |
-| + DiT Caching | 5.5x | 1.04s |
-| + Torch Compile + CUDA Graphs | 8.9x | 0.64s |
-| + Kernel & Scheduler Opts | 9.6x | 0.59s |
+| Optimization | H100 Speedup | H100 Time | GB200 Speedup | GB200 Time |
+|---|---|---|---|---|
+| Baseline (single GPU) | 1x | 5.7s | 1.1x | 5.2s |
+| + CFG Parallelism (2 GPUs) | 1.9x | 3.0s | 1.8x | 3.2s |
+| + DiT Caching | 5.5x | 1.04s | 5.4x | 1.06s |
+| + Torch Compile + CUDA Graphs | 8.9x | 0.64s | 10.9x | 0.52s |
+| + Kernel & Scheduler Opts | 9.6x | 0.59s | 14.8x | 0.39s |
+| + Quantization (NVFP4) | — | — | 16.6x | 0.34s |
+| + DreamZero-Flash | — | — | 38x | 0.15s |
 
 **Our setup:** Single H100 PCIe, FA2, DiT caching, dynamic cache scheduling → **~2.6s avg**
 
@@ -440,9 +442,10 @@ Measured on 2x H100 80GB HBM3 (GCP) with FA2, DiT caching, dynamic cache schedul
 |---|---|---|---|
 | Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 1x |
 | **2x H100 (FA2 + CFG)** | **~1.0s** | **0.6 – 0.9s** | **2.6x** |
-| Paper (GB200 + TRT + NVFP4) | ~0.6s | — | — |
+| Paper H100 (9.6x, no quant) | ~0.6s | — | — |
+| Paper GB200 (16.6x, NVFP4) | ~0.34s | — | — |
 
-The 2x H100 setup achieves ~1.0s without TRT, already close to the paper's 0.6s GB200 result. TRT is not viable on H100 even with 2 GPUs — CFG parallelism replicates the full model per GPU, so each GPU still needs TRT + PyTorch DiT + KV cache > 80GB. See the [TensorRT section above](#tensorrt-quantization-on-h100-nvfp4fp8) for details.
+The 2x H100 setup achieves ~1.0s without TRT, approaching the paper's H100 target of ~0.6s (9.6x). The remaining gap is likely H100 PCIe vs SXM bandwidth differences. TRT is not viable on H100 even with 2 GPUs — CFG parallelism replicates the full model per GPU, so each GPU still needs TRT + PyTorch DiT + KV cache > 80GB. See the [TensorRT section above](#tensorrt-quantization-on-h100-nvfp4fp8) for details.
 
 ## Inference using Double Nvidia H200 (Avant)
 
@@ -570,9 +573,10 @@ Note: TRT on H200 requires disabling the CPU offloading code (designed for H100'
 | 2x H100 (TRT + CFG) | OOM | — | 80GB | No |
 | 2x H200 (FA2 + CFG) | ~0.93s | 0.58 – 0.88s | 141GB | Yes |
 | **2x H200 (TRT FP8 + CFG)** | **~0.58s** | **0.27 – 0.38s** | **141GB** | **Yes** |
-| Paper (GB200 + TRT + NVFP4) | ~0.6s | — | 192GB | Yes |
+| Paper H100 (9.6x, no quant) | ~0.6s | — | 80GB | Yes |
+| Paper GB200 (16.6x, NVFP4) | ~0.34s | — | 192GB | Yes |
 
-**2x H200 with TRT FP8 matches the paper's GB200 result (~0.6s) and is actually slightly faster (~0.58s).** The key enabler is H200's 141GB VRAM — enough for TRT engine (15.5GB) + PyTorch DiT (~28GB) + KV cache + other models to coexist on each GPU without offloading.
+**2x H200 with TRT FP8 matches the paper's H100 result (~0.6s at 9.6x without quantization) and is slightly faster (~0.58s).** The paper's GB200 with NVFP4 achieves ~0.34s (16.6x), so there's still a ~1.7x gap to match GB200. The key enabler for TRT on H200 is the 141GB VRAM — enough for TRT engine (15.5GB) + PyTorch DiT (~28GB) + KV cache + other models to coexist on each GPU without offloading.
 
 
 ## Training
