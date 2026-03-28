@@ -541,20 +541,38 @@ Measured on 2x H200 141GB HBM3e (GCP) with FA2, DiT caching, dynamic cache sched
 | Text Encoder | 0.01s | |
 | VAE | 0.00 – 0.05s | |
 
-### Performance Summary (TRT FP8 + CFG) — Pending
+### Performance Summary (TRT FP8 + CFG)
 
-TRT FP8 engine build and benchmarks in progress. With 141GB per GPU, TRT + PyTorch DiT should coexist without OOM. Expected ~0.5s per inference.
+Measured on 2x H200 141GB HBM3e (GCP) with TRT FP8, DiT caching, dynamic cache scheduling, and CFG parallelism. **No OOM** — H200's 141GB per GPU fits TRT engine + PyTorch DiT + KV cache simultaneously.
 
-**Table 11: All hardware comparison**
+**Table 11: 2x H200 TRT FP8 inference breakdown**
 
-| Setup | Avg Inference | Diffusion | VRAM/GPU |
-|---|---|---|---|
-| Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 80GB |
-| 2x H100 (FA2 + CFG) | ~1.0s | 0.6 – 0.9s | 80GB |
-| 2x H100 (TRT + CFG) | OOM | — | 80GB (insufficient) |
-| **2x H200 (FA2 + CFG)** | **~0.93s** | **0.58 – 0.88s** | **141GB** |
-| 2x H200 (TRT + CFG) | ~0.5s (expected) | ~0.3s (expected) | 141GB |
-| Paper (GB200 + TRT + NVFP4) | ~0.6s | — | 192GB |
+| Component | Time | Notes |
+|---|---|---|
+| **Total inference** | **0.53 – 0.64s** (avg ~0.58s) | End-to-end per action chunk |
+| Warmup (1st call) | ~15s | TRT engine initialization |
+| Warmup (2nd call) | ~3s | VAE compile |
+| Diffusion | 0.27 – 0.38s | TRT FP8 + CFG parallelism |
+| DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (from 16 base) |
+| KV Cache Creation | 0.08 – 0.19s | PyTorch DiT stays on GPU (no offloading needed) |
+| Image Encoder | 0.18-0.23s first call, 0.00s cached | |
+| Text Encoder | 0.01s | |
+| VAE | 0.00 – 0.06s | |
+
+Note: TRT on H200 requires disabling the CPU offloading code (designed for H100's 80GB limit). Comment out `self.model.cpu()` and `torch.cuda.empty_cache()` in `wan_flow_matching_action_tf.py` lines ~908 and ~1392.
+
+**Table 12: All hardware comparison**
+
+| Setup | Avg Inference | Diffusion | VRAM/GPU | No OOM |
+|---|---|---|---|---|
+| Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 80GB | Yes |
+| 2x H100 (FA2 + CFG) | ~1.0s | 0.6 – 0.9s | 80GB | Yes |
+| 2x H100 (TRT + CFG) | OOM | — | 80GB | No |
+| 2x H200 (FA2 + CFG) | ~0.93s | 0.58 – 0.88s | 141GB | Yes |
+| **2x H200 (TRT FP8 + CFG)** | **~0.58s** | **0.27 – 0.38s** | **141GB** | **Yes** |
+| Paper (GB200 + TRT + NVFP4) | ~0.6s | — | 192GB | Yes |
+
+**2x H200 with TRT FP8 matches the paper's GB200 result (~0.6s) and is actually slightly faster (~0.58s).** The key enabler is H200's 141GB VRAM — enough for TRT engine (15.5GB) + PyTorch DiT (~28GB) + KV cache + other models to coexist on each GPU without offloading.
 
 
 ## Training
