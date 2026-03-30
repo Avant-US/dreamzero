@@ -495,8 +495,8 @@ pip install --no-deps -e .
 # Download checkpoint (~45GB, saves to RAM-backed cache)
 python -c "from huggingface_hub import snapshot_download; snapshot_download('GEAR-Dreams/DreamZero-DROID', local_dir='/root/.cache/huggingface/dreamzero-checkpoints')"
 
-# Run 2-GPU inference with FA2 + CFG parallelism
-ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true \
+# Run 2-GPU inference with TE + CFG parallelism (TE is the default attention backend)
+DYNAMIC_CACHE_SCHEDULE=true \
   CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   socket_test_optimized_AR.py --port 5000 --enable-dit-cache \
   --model-path /root/.cache/huggingface/dreamzero-checkpoints
@@ -526,23 +526,36 @@ LOAD_TRT_ENGINE=/root/.cache/huggingface/dreamzero-checkpoints/tensorrt/wan/WanM
   --model-path /root/.cache/huggingface/dreamzero-checkpoints
 ```
 
-### Performance Summary (FA2 + CFG, no TRT)
+### Performance Summary (TE + CFG, no TRT)
 
-Measured on 2x H200 141GB HBM3e (GCP) with FA2, DiT caching, dynamic cache scheduling, and CFG parallelism:
+Measured on 2x H200 141GB HBM3e (GCP) with TE (cuDNN fused attention), DiT caching, dynamic cache scheduling, and CFG parallelism:
 
-**Table 10: 2x H200 FA2 inference breakdown**
+**Table 10: 2x H200 TE inference breakdown**
 
 | Component | Time | Notes |
 |---|---|---|
-| **Total inference** | **0.85 – 1.15s** (avg ~0.93s) | End-to-end per action chunk |
-| Warmup (1st call) | ~90s | Torch compile + cache initialization |
+| **Total inference** | **0.78 – 1.01s** (avg ~0.87s) | End-to-end per action chunk |
+| Warmup (1st call) | ~91s | Torch compile + cache initialization |
 | Warmup (2nd call) | ~17s | VAE compile + scheduling warmup |
-| Diffusion | 0.58 – 0.88s | CFG parallelism splits across 2 GPUs |
+| Diffusion | 0.54 – 0.78s | CFG parallelism splits across 2 GPUs |
 | DIT Compute Steps | 4–5 steps | Dynamic cache skips redundant steps (from 16 base) |
-| KV Cache Creation | 0.09 – 0.18s | |
-| Image Encoder | 0.18-0.24s first call, 0.00s cached | |
+| KV Cache Creation | 0.08 – 0.19s | |
+| Image Encoder | 0.18-0.25s first call, 0.00s cached | |
 | Text Encoder | 0.01s | |
-| VAE | 0.00 – 0.05s | |
+| VAE | 0.00 – 0.06s | |
+
+### TE vs FA2 on H200
+
+Unlike on single H100 (where FA2 is faster), **TE outperforms FA2 on 2x H200** with CFG parallelism:
+
+**Table 10b: 2x H200 attention backend comparison**
+
+| Attention Backend | Avg Inference (4 steps) | Avg Diffusion | Notes |
+|---|---|---|---|
+| **TE (cuDNN fused attn)** | **~0.84s** | **~0.58s** | Recommended for H200 |
+| FA2 (FlashAttention2) | ~0.93s | ~0.73s | ~10% slower on H200 |
+
+The paper's Table 1 benchmarks use TE (cuDNN fused attention) as the "Kernel & Scheduler Opts" row, and H200's 4.8 TB/s HBM3e bandwidth (vs H100 SXM's 3.35 TB/s) favors TE's memory-bound kernels. Use the default TE backend on H200 (do not set `ATTENTION_BACKEND=FA2`).
 
 ### Performance Summary (TRT FP8 + CFG)
 
@@ -572,11 +585,12 @@ Note: TRT on H200 requires disabling the CPU offloading code (designed for H100'
 | 2x H100 (FA2 + CFG) | ~1.0s | 0.6 – 0.9s | 80GB | Yes |
 | 2x H100 (TRT + CFG) | OOM | — | 80GB | No |
 | 2x H200 (FA2 + CFG) | ~0.93s | 0.58 – 0.88s | 141GB | Yes |
+| 2x H200 (TE + CFG) | ~0.87s | 0.54 – 0.78s | 141GB | Yes |
 | **2x H200 (TRT FP8 + CFG)** | **~0.58s** | **0.27 – 0.38s** | **141GB** | **Yes** |
 | Paper H100 (9.6x, no quant) | ~0.6s | — | 80GB | Yes |
 | Paper GB200 (16.6x, NVFP4) | ~0.34s | — | 192GB | Yes |
 
-**2x H200 with TRT FP8 matches the paper's H100 result (~0.6s at 9.6x without quantization) and is slightly faster (~0.58s).** The paper's GB200 with NVFP4 achieves ~0.34s (16.6x), so there's still a ~1.7x gap to match GB200. The key enabler for TRT on H200 is the 141GB VRAM — enough for TRT engine (15.5GB) + PyTorch DiT (~28GB) + KV cache + other models to coexist on each GPU without offloading.
+**2x H200 with TE + CFG parallelism achieves ~0.87s avg (~0.84s on 4-step inferences), with diffusion time (~0.58s) matching the paper's H100 total of ~0.59s.** The remaining gap is non-diffusion overhead (KV cache, VAE, scheduling). With TRT FP8, total drops to ~0.58s, matching the paper. The paper's GB200 with NVFP4 achieves ~0.34s (16.6x), so there's still a ~1.7x gap to match GB200. The key enabler for TRT on H200 is the 141GB VRAM — enough for TRT engine (15.5GB) + PyTorch DiT (~28GB) + KV cache + other models to coexist on each GPU without offloading.
 
 
 ## Training
