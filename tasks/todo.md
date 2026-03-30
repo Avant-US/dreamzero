@@ -69,7 +69,9 @@ CUDA_VISIBLE_DEVICES=0,1 \
 
 **Expected:** Roughly paper_baseline / 1.9 scaled by H200/H100 bandwidth ratio
 
-- [ ] Record: total ___s, diffusion ___s, effective steps: 16
+- [x] Record: total ~2.88s, diffusion ~2.58s, effective steps: 16
+- [x] Diffusion varies 2.32-2.82s in a repeating 4-call cycle (KV cache grows then resets)
+- [x] Paper H100: 3.0s -- our 2.88s is slightly faster (H200 bandwidth advantage)
 
 ---
 
@@ -95,7 +97,10 @@ CUDA_VISIBLE_DEVICES=0,1 \
 - Should reduce effective steps from 16 to ~4-5 via cosine similarity
 - The diffusion time should drop ~3x while non-diffusion time stays constant
 
-- [ ] Record: total ___s, diffusion ___s, effective steps: ___
+- [x] Record: total ~1.03s, diffusion ~0.70s, effective steps: 4-6
+- [x] Caching reduces diffusion from ~2.58s to ~0.70s (3.7x on diffusion alone)
+- [x] Total 2.88s -> 1.03s = 2.8x speedup from caching
+- [x] Paper H100: 1.04s -- our 1.03s matches almost exactly
 
 ---
 
@@ -121,8 +126,12 @@ CUDA_VISIBLE_DEVICES=0,1 \
 - The paper's 1.6x includes DiT compile + CUDA graphs, so we expect less than 1.6x here
 - Compare encoder/VAE/scheduler time breakdown vs Step 2 to see compile impact
 
-- [ ] Record: total ___s, diffusion ___s, effective steps: ___
-- [ ] Compare non-diffusion time vs Step 2 to isolate compile contribution
+- [x] Record: total ~0.95s, diffusion ~0.68s, effective steps: 4-5
+- [x] First 2 calls are warmup (66s, 16.8s) due to torch.compile tracing
+- [x] Compile shaves ~0.08s off total vs Step 2 (1.03s -> 0.95s = ~8% faster)
+- [x] Breakdown: Text Enc 0.03->0.01s, Image Enc 0.30->0.18s, VAE 0.07->0.05s
+- [x] Diffusion time unchanged (~0.68 vs ~0.70) -- confirms compile only helps encoders/VAE
+- [x] Paper H100: 0.64s -- our 0.95s still 0.31s behind (missing DiT compile + CUDA graphs)
 
 ---
 
@@ -197,9 +206,9 @@ CUDA_VISIBLE_DEVICES=0,1 \
 
 | Step | Config | Paper H100 | Our 2x H200 | Delta |
 |------|--------|-----------|-------------|-------|
-| 1. CFG Only | 2 GPU, no cache, no compile, FA2 | 3.0s | ___s | |
-| 2. + DiT Caching | + DYNAMIC_CACHE_SCHEDULE | 1.04s | ___s | |
-| 3. + Torch Compile | + DISABLE_TORCH_COMPILE=false | 0.64s | ___s | |
+| 1. CFG Only | 2 GPU, no cache, no compile, FA2 | 3.0s | ~2.88s | -4% (H200 faster) |
+| 2. + DiT Caching | + DYNAMIC_CACHE_SCHEDULE | 1.04s | ~1.03s | matches paper |
+| 3. + Torch Compile | + DISABLE_TORCH_COMPILE=false | 0.64s | ~0.95s | +48% (missing DiT compile) |
 | 4. + TE Attention | + ATTENTION_BACKEND=TE | 0.59s | ~0.87s | |
 | 5. + TRT FP8 | + LOAD_TRT_ENGINE | 0.34s* | ~0.58s | |
 

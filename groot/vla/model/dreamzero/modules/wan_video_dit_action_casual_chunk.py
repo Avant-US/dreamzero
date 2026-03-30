@@ -26,6 +26,10 @@ import torch.distributed as dist
 import os
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+_USE_POLAR_ROPE = (
+    os.getenv("USE_POLAR_ROPE", "false").lower() == "true"
+    and not ENABLE_TENSORRT
+)
 
 
 class CategorySpecificLinear(nn.Module):
@@ -91,7 +95,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
 
 def causal_rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index):
-    if ENABLE_TENSORRT:
+    if not _USE_POLAR_ROPE:
         return causal_rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
     else:
         return causal_rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)

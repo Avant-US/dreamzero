@@ -44,6 +44,10 @@ from diffusers.models.modeling_utils import ModelMixin
     
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
 DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() == "true"
+_USE_POLAR_ROPE = (
+    os.getenv("USE_POLAR_ROPE", "false").lower() == "true"
+    and not ENABLE_TENSORRT
+)
 if ENABLE_TENSORRT:
     # disable torch compile and transformer engine and flash attention for onnx/tensorrt export
     FLASH_ATTN_COMPATIBILITY_MODE = True
@@ -149,14 +153,14 @@ def _RMSNorm(normalized_shape, eps):
 
 
 def RotaryPositionEmbedding(num_heads, head_dim):
-    if ENABLE_TENSORRT:
+    if not _USE_POLAR_ROPE:
         return RotaryPositionEmbeddingNoPolarOp(num_heads, head_dim)
     else:
         return RotaryPositionEmbeddingWithPolarOp(num_heads, head_dim)
 
 
 def rope_apply(x, freqs, num_heads):
-    if ENABLE_TENSORRT:
+    if not _USE_POLAR_ROPE:
         return rope_apply_no_polar_op(x, freqs, num_heads)
     else:
         return rope_apply_polar_op(x, freqs, num_heads)
