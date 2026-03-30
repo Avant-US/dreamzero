@@ -1240,7 +1240,7 @@ class CausalHead(nn.Module):
         for part in e:
             L_e = part.shape[1]
             repeat_count = (L + L_e - 1) // L_e
-            aligned.append(part.repeat(1, repeat_count, 1)[:, :L])
+            aligned.append(part.repeat(1, repeat_count, 1, 1)[:, :L])
         e = tuple(aligned)
         x = (self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
         return x
