@@ -1393,7 +1393,8 @@ class WANPolicyHead(ActionHead):
             self.model._compiled_forward_blocks = torch.compile(
                 self.model._forward_blocks_compiled,
                 mode=COMPILE_DIT_MODE,
-                dynamic=False,
+                fullgraph=False,
+                dynamic=True,
             )
 
         self.trt_engine = None
