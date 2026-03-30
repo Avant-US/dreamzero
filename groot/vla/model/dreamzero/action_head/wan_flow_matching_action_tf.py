@@ -1368,7 +1368,8 @@ class WANPolicyHead(ActionHead):
 
         # Torch compile the modules. Skip _forward_blocks: dynamic KV cache shapes cause
         # constant recompilation, and RoPE complex ops lack inductor codegen support.
-        if not ENABLE_TENSORRT:
+        DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() == "true"
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
             self.text_encoder.forward = torch.compile(
