@@ -8,23 +8,23 @@ Paper reference: Table 1, 5.7s baseline, cumulative to 9.6x on H100
 
 ## Docker Setup
 
-Start the container with both GPUs exposed:
+Start the container with both GPUs and /mnt/r mounted:
 ```bash
-docker run --gpus all -it \
-  --ipc=host \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  -p 5000:5000 \
-  -v ~/dreamzero:/workspace \
-  -w /workspace \
-  --name dreamzero-bench \
-  dreamzero
+docker run --gpus all -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 5000:5000 -v ~/dreamzero:/workspace -v /mnt/r:/mnt/r -w /workspace --name dreamzero-bench dreamzero
 ```
 
 One-time setup inside the container:
 ```bash
 pip install --no-deps -e .
 ```
+
+Download checkpoints (writes to /mnt/r via symlink):
+```bash
+HF_HOME=/mnt/r/huggingface_cache python -c "from huggingface_hub import snapshot_download; snapshot_download('GEAR-Dreams/DreamZero-DROID', local_dir='./huggingface_checkpoints')"
+```
+
+**Note:** All benchmark commands below require `HF_HOME=/mnt/r/huggingface_cache` prefix
+to avoid downloading to the full root disk.
 
 ## Protocol
 
