@@ -205,10 +205,6 @@ class WANPolicyHead(ActionHead):
         
         self._device = "cuda"
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
-        self._cuda_graph_enabled = os.getenv("ENABLE_CUDA_GRAPH", "False").lower() == "true"
-        self._cuda_graph = None
-        self._cuda_graph_static_inputs = None
-        self._cuda_graph_static_outputs = None
 
 
         num_dit_steps = 8
@@ -853,77 +849,6 @@ class WANPolicyHead(ActionHead):
         return text_inputs
 
 
-    def _run_model_with_cuda_graph(
-        self,
-        noisy_input: torch.Tensor,
-        timestep: torch.Tensor,
-        action: torch.Tensor,
-        timestep_action: torch.Tensor,
-        state: torch.Tensor,
-        embodiment_id: torch.Tensor,
-        prompt_emb: torch.Tensor,
-        seq_len: int,
-        y: torch.Tensor,
-        clip_feature: torch.Tensor,
-        kv_cache: KVCacheType,
-        crossattn_cache: KVCacheType,
-        start_frame: int,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
-        """Run model forward with CUDA graph capture/replay for fixed-shape diffusion steps."""
-        if self._cuda_graph is None:
-            # First call: warmup + capture
-            # Warmup run (populates internal caches like cuDNN workspace)
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                self.model(
-                    noisy_input, timestep,
-                    action=action, timestep_action=timestep_action,
-                    state=state, embodiment_id=embodiment_id,
-                    context=prompt_emb, seq_len=seq_len, y=y,
-                    clip_feature=clip_feature, kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache, current_start_frame=start_frame,
-                )
-            torch.cuda.current_stream().wait_stream(s)
-
-            # Store static input references for copy-in on replay
-            self._cuda_graph_static_inputs = dict(
-                noisy_input=noisy_input, timestep=timestep,
-                action=action, timestep_action=timestep_action,
-                state=state, embodiment_id=embodiment_id,
-                prompt_emb=prompt_emb, y=y,
-                clip_feature=clip_feature,
-            )
-
-            # Capture
-            self._cuda_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._cuda_graph):
-                obs_out, act_out, kv_out = self.model(
-                    noisy_input, timestep,
-                    action=action, timestep_action=timestep_action,
-                    state=state, embodiment_id=embodiment_id,
-                    context=prompt_emb, seq_len=seq_len, y=y,
-                    clip_feature=clip_feature, kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache, current_start_frame=start_frame,
-                )
-            self._cuda_graph_static_outputs = (obs_out, act_out, kv_out)
-            return obs_out, act_out, kv_out
-        else:
-            # Replay: copy changing inputs into static buffers, then replay graph
-            si = self._cuda_graph_static_inputs
-            si["noisy_input"].copy_(noisy_input)
-            si["timestep"].copy_(timestep)
-            si["action"].copy_(action)
-            si["timestep_action"].copy_(timestep_action)
-            self._cuda_graph.replay()
-            return self._cuda_graph_static_outputs
-
-    def _invalidate_cuda_graph(self):
-        """Reset CUDA graph when input shapes change (e.g. new AR step with different KV cache)."""
-        self._cuda_graph = None
-        self._cuda_graph_static_inputs = None
-        self._cuda_graph_static_outputs = None
-
     def _run_diffusion_steps(
         self,
         noisy_input: torch.Tensor,
@@ -941,12 +866,6 @@ class WANPolicyHead(ActionHead):
         kv_cache_metadata: dict[str, bool | int],
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         predictions = []
-        use_cuda_graph = (
-            self._cuda_graph_enabled
-            and not kv_cache_metadata["update_kv_cache"]
-            and self.trt_engine is None
-            and action is not None
-        )
         for index, prompt_emb in enumerate(context):
             kv_cache = kv_caches[index]
             crossattn_cache = crossattn_caches[index]
@@ -961,13 +880,6 @@ class WANPolicyHead(ActionHead):
                     y=y,
                     clip_feature=clip_feature,
                     kv_cache=kv_cache,
-                )
-            elif use_cuda_graph:
-                obs_noise_pred, action_noise_pred, _ = self._run_model_with_cuda_graph(
-                    noisy_input, timestep, action, timestep_action,
-                    state, embodiment_id, prompt_emb, seq_len, y,
-                    clip_feature, kv_cache, crossattn_cache,
-                    kv_cache_metadata["start_frame"],
                 )
             else:
                 # If TRT is loaded, PyTorch DiT lives on CPU — move to GPU for KV cache updates
@@ -1127,20 +1039,16 @@ class WANPolicyHead(ActionHead):
             print("language is None, reset current_start_frame to 0")
             self.language = data["text"]
             self.current_start_frame = 0
-            self._invalidate_cuda_graph()
         elif not torch.equal(self.language, data["text"]):
             print("language changed, reset current_start_frame to 0")
             self.current_start_frame = 0
-            self._invalidate_cuda_graph()
             self.language = data["text"]
         elif videos.shape[2] == 1:
             print("videos.shape[2] == 1, reset current_start_frame to 0")
             self.current_start_frame = 0
-            self._invalidate_cuda_graph()
         elif self.current_start_frame >= self.model.local_attn_size:
             print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
             self.current_start_frame = 0
-            self._invalidate_cuda_graph()
 
         if self.ip_rank == 0:
             print("videos shape", videos.shape, self.num_frames)
@@ -1225,9 +1133,6 @@ class WANPolicyHead(ActionHead):
                 dtype=noise_obs.dtype,
                 device=noise_obs.device,
             )
-
-        # Invalidate CUDA graph since KV cache shape changes each AR step
-        self._invalidate_cuda_graph()
 
         assert self.kv_cache1 is not None
         assert self.kv_cache_neg is not None

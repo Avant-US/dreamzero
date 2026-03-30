@@ -173,7 +173,6 @@ CUDA_VISIBLE_DEVICES=0 \
 | `DISABLE_TORCH_COMPILE` | `true`, `false` | `false` | Disable torch.compile on encoders/VAE/scheduler |
 | `NUM_DIT_STEPS` | `5`,`6`,`7`,`8`,`16` | `8` | Base diffusion steps (before dynamic cache skipping) |
 | `LOAD_TRT_ENGINE` | path | unset | Load TensorRT FP8 engine for quantized diffusion |
-| `ENABLE_CUDA_GRAPH` | `true`, `false` | `false` | CUDA graph capture on DiT forward in diffusion loop |
 | `USE_POLAR_ROPE` | `true`, `false` | `false` | Use complex polar RoPE (slower, for training/debug) |
 | `ENABLE_TENSORRT` | `true`, `false` | `false` | Enable TRT mode (disables torch.compile + TE) |
 
