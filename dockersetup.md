@@ -1,12 +1,12 @@
-# DreamZero Docker Setup (H100)
+# DreamZero Docker Setup
 
-This guide walks through building and running DreamZero using NVIDIA's PyTorch Docker container on an H100 GPU. The Dockerfile installs all dependencies into the image so they persist across container restarts.
+This guide walks through building and running DreamZero using NVIDIA's PyTorch Docker container. Tested on H100 and H200 GPUs.
 
 ---
 
 ## Prerequisites
 
-- NVIDIA H100 GPU
+- NVIDIA GPU (H100 or H200)
 - Ubuntu (tested on 22.04)
 - NVIDIA driver installed (verify with `nvidia-smi`)
 - Docker installed
@@ -30,7 +30,7 @@ sudo systemctl restart docker
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
 ```
-You should see your H100 listed inside the container.
+You should see your GPU(s) listed inside the container.
 
 ## 3. Login to NVIDIA NGC
 NGC requires API key authentication.
@@ -68,6 +68,7 @@ docker run --gpus all -it --rm \
   dreamzero
 ```
 Notes:
+- `--gpus all` -- exposes all GPUs (use `--gpus '"device=0,1"'` to select specific ones)
 - `--ipc=host` -- required for PyTorch shared memory
 - `--ulimit` -- avoids memory issues
 - `-p 5000:5000` -- exposes the inference server port so clients can connect from the host
@@ -99,7 +100,7 @@ print("fp8_autocast exists:", hasattr(te, "fp8_autocast"))
 PY
 ```
 
-## 7. Test FP8 Execution (H100)
+## 7. Test FP8 Execution
 ```bash
 python - <<'PY'
 import torch
@@ -126,13 +127,55 @@ pip install --no-deps -e .
 
 ## 9. Launch Inference Server
 
-Use `ATTENTION_BACKEND=FA2` on H100 for best performance (~2.6s vs ~4.5s with TE). TE's cuDNN attention kernels are optimized for GB200/Blackwell and are slower than FlashAttention2 on Hopper. Dynamic cache scheduling with default 16 base steps is slightly faster than explicitly setting `NUM_DIT_STEPS=5`.
+### 2x H200 (recommended)
+
+Use TE attention backend on H200 for best performance (~0.87s avg). H200's 4.8 TB/s HBM3e bandwidth favors TE's memory-bound kernels over FA2.
 
 ```bash
-ATTENTION_BACKEND=FA2 DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0 \
-  torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
+DYNAMIC_CACHE_SCHEDULE=true \
+ATTENTION_BACKEND=TE \
+CUDA_VISIBLE_DEVICES=0,1 \
+  torchrun --standalone --nproc_per_node=2 \
+  socket_test_optimized_AR.py \
   --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
 ```
+
+### 2x H100
+
+Use FA2 attention backend on H100 (~1.0s avg). TE's cuDNN kernels are optimized for Blackwell and are slower than FlashAttention2 on Hopper.
+
+```bash
+DYNAMIC_CACHE_SCHEDULE=true \
+ATTENTION_BACKEND=FA2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+  torchrun --standalone --nproc_per_node=2 \
+  socket_test_optimized_AR.py \
+  --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
+```
+
+### Single GPU (H100 or H200)
+
+```bash
+DYNAMIC_CACHE_SCHEDULE=true \
+ATTENTION_BACKEND=FA2 \
+CUDA_VISIBLE_DEVICES=0 \
+  torchrun --standalone --nproc_per_node=1 \
+  socket_test_optimized_AR.py \
+  --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
+```
+
+### Environment Variables
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `ATTENTION_BACKEND` | `TE`, `FA2`, `FA3`, `torch` | `TE` | Attention kernel backend. Use TE on H200/GB200, FA2 on H100 |
+| `DYNAMIC_CACHE_SCHEDULE` | `true`, `false` | `false` | Cosine-similarity step skipping (16 -> ~4-5 effective steps) |
+| `DISABLE_TORCH_COMPILE` | `true`, `false` | `false` | Disable torch.compile on encoders/VAE/scheduler |
+| `NUM_DIT_STEPS` | `5`,`6`,`7`,`8`,`16` | `8` | Base diffusion steps (before dynamic cache skipping) |
+| `LOAD_TRT_ENGINE` | path | unset | Load TensorRT FP8 engine for quantized diffusion |
+| `ENABLE_TENSORRT` | `true`, `false` | `false` | Enable TRT mode (disables torch.compile + TE) |
+
+### Testing
 
 Test from a second shell (or from the host if port is exposed):
 ```bash
@@ -141,24 +184,26 @@ docker exec -it dreamzero-dev python test_client_AR.py --port 5000
 
 ## 10. (Optional) Build TensorRT FP8 Engine
 
-TensorRT quantization reduces diffusion time from ~2.6s to ~0.85s, but on a single 80GB H100 it OOMs after 2-3 inference calls because the TRT engine (15.5GB) + PyTorch DiT (~28GB, needed for KV cache) + KV cache exceeds 80GB. This optimization is only viable with 2+ GPUs. See the README for full details.
+TensorRT quantization reduces diffusion time significantly but requires sufficient GPU memory. On a single 80GB H100 it OOMs after 2-3 inference calls. This optimization is viable with 2x H200 (141GB each) or 2+ GPUs with sufficient memory.
 
-To build the engine anyway (useful for benchmarking or multi-GPU setups):
+To build the engine (~10-15 min):
 ```bash
 # Install ONNX export dependencies
 pip install onnxconverter-common onnx onnxruntime onnxslim
 pip install onnx_graphsurgeon --extra-index-url https://pypi.ngc.nvidia.com
 pip install numpy==1.26.4
 
-# Build FP8 engine (~10-15 min)
+# Build FP8 engine
 bash scripts/inference/build_trt_engine.sh \
     --model-path ./huggingface_checkpoints \
     --tensorrt fp8 \
     --cuda-device 0
 
-# Run with TRT engine
+# Run with TRT engine (2x H200)
 LOAD_TRT_ENGINE=./huggingface_checkpoints/tensorrt/wan/WanModel_fp8.trt \
-  DYNAMIC_CACHE_SCHEDULE=true CUDA_VISIBLE_DEVICES=0 \
-  torchrun --standalone --nproc_per_node=1 socket_test_optimized_AR.py \
+DYNAMIC_CACHE_SCHEDULE=true \
+CUDA_VISIBLE_DEVICES=0,1 \
+  torchrun --standalone --nproc_per_node=2 \
+  socket_test_optimized_AR.py \
   --port 5000 --enable-dit-cache --model-path ./huggingface_checkpoints
 ```
