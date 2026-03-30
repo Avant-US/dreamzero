@@ -1174,18 +1174,14 @@ class CausalWanAttentionBlock(nn.Module):
         """
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
-        # Align modulation sequence length to x so mul/add broadcast (e.g. when F != L under compile)
+        # Align modulation sequence length to x so mul/add broadcast (e.g. when F != L)
+        # Branch-free: always repeat-then-slice (works for all cases including L_e == L)
         L = x.shape[1]
         aligned = []
         for part in e:
             L_e = part.shape[1]
-            if L_e == L:
-                aligned.append(part)
-            elif L_e >= L:
-                aligned.append(part[:, :L])
-            else:
-                repeat = (L + L_e - 1) // L_e
-                aligned.append(part.repeat(1, repeat, 1)[:, :L])
+            repeat_count = (L + L_e - 1) // L_e
+            aligned.append(part.repeat(1, repeat_count, 1, 1)[:, :L])
         e = tuple(aligned)
 
         # self-attention
@@ -1238,18 +1234,13 @@ class CausalHead(nn.Module):
             e(Tensor): Shape [B, F, 1, C]
         """
         e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        # Align modulation sequence length to x (e.g. when F != L1 under compile)
+        # Align modulation sequence length to x (branch-free: always repeat-then-slice)
         L = x.shape[1]
         aligned = []
         for part in e:
             L_e = part.shape[1]
-            if L_e == L:
-                aligned.append(part)
-            elif L_e >= L:
-                aligned.append(part[:, :L])
-            else:
-                repeat = (L + L_e - 1) // L_e
-                aligned.append(part.repeat(1, repeat, 1)[:, :L])
+            repeat_count = (L + L_e - 1) // L_e
+            aligned.append(part.repeat(1, repeat_count, 1)[:, :L])
         e = tuple(aligned)
         x = (self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
         return x
@@ -1827,6 +1818,80 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         return x_video, action_noise_pred, updated_kv_caches
 
+    def _forward_blocks_compiled(
+        self,
+        x: torch.Tensor,
+        seq_len: int,
+        freqs: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        clip_feature: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state: torch.Tensor,
+        kv_cache: list[torch.Tensor],
+        current_start_frame: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward blocks optimized for torch.compile (inference diffusion loop only).
+
+        Assumes: action, clip_feature always present; KV cache is read-only.
+        """
+        x = x.flatten(start_dim=2).transpose(1, 2)
+
+        B = x.shape[0]
+        F = timestep.shape[1]
+
+        # Action path (always active during diffusion inference)
+        action_features = self.action_encoder(action, timestep_action, embodiment_id)
+        state_features = self.state_encoder(state, embodiment_id)
+        action_register = torch.cat([action_features, state_features], dim=1)
+        action_length = action_features.shape[1]
+        action_register_length = action_register.shape[1]
+        x = torch.cat([x, action_register], dim=1)
+
+        # Time embeddings: always repeat+slice (branch-free)
+        repeat_count = (seq_len + F - 1) // F
+        timestep = timestep.repeat(1, repeat_count)[:, :seq_len]
+
+        stride = timestep_action.shape[1] // state_features.shape[1]
+        timestep_state = timestep_action[:, ::stride]
+        timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
+
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
+        e = e.unflatten(dim=0, sizes=(B, -1))
+        e0 = self.time_projection(e)
+        e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
+
+        # Context (clip always present for i2v)
+        context = self.text_embedding(context)
+        clip_embedding = self.img_emb(clip_feature)
+        context = torch.cat([clip_embedding, context], dim=1)
+
+        # Block loop (no KV cache collection needed)
+        for block_index, block in enumerate(self.blocks):
+            x, _ = block(
+                x=x,
+                e=e0,
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                context=context,
+                action_register_length=action_register_length,
+                kv_cache=kv_cache[block_index],
+                current_start_frame=current_start_frame,
+            )
+
+        action_noise_pred = x[:, seq_len: seq_len + action_length]
+        action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
+
+        x_video = x[:, :seq_len]
+        e_video = e[:, :seq_len]
+        x_video = self.head(x_video, e_video.unsqueeze(2))
+
+        return x_video, action_noise_pred
+
 
     def _forward_inference_trt(
         self,
@@ -1924,6 +1989,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         timestep_action=None,
         state=None,
         embodiment_id=None,
+        update_kv_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         r"""
         Run the diffusion model with kv caching.
@@ -1973,27 +2039,49 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             start_frame=current_start_frame,
         )
 
-        x_video, action_noise_pred, updated_kv_caches = self._forward_blocks(
-            x=x,
-            seq_len=seq_len,
-            freqs=freqs,
-            timestep=timestep,
-            context=context,
-            clip_feature=clip_feature,
-            embodiment_id=embodiment_id,
-            action=action,
-            timestep_action=timestep_action,
-            state=state,
-            kv_cache=kv_cache,
-            current_start_frame=current_start_frame,
+        # Use compiled blocks for diffusion loop (update_kv_cache=False, all inputs present)
+        _use_compiled = (
+            hasattr(self, '_compiled_forward_blocks')
+            and not update_kv_cache
+            and action is not None
         )
+        if _use_compiled:
+            embodiment_id_t = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            x_video, action_noise_pred = self._compiled_forward_blocks(
+                x=x,
+                seq_len=seq_len,
+                freqs=freqs,
+                timestep=timestep,
+                context=context,
+                clip_feature=clip_feature,
+                embodiment_id=embodiment_id_t,
+                action=action,
+                timestep_action=timestep_action,
+                state=state,
+                kv_cache=kv_cache,
+                current_start_frame=current_start_frame,
+            )
+            updated_kv_caches = kv_cache  # unchanged
+        else:
+            x_video, action_noise_pred, updated_kv_caches = self._forward_blocks(
+                x=x,
+                seq_len=seq_len,
+                freqs=freqs,
+                timestep=timestep,
+                context=context,
+                clip_feature=clip_feature,
+                embodiment_id=embodiment_id,
+                action=action,
+                timestep_action=timestep_action,
+                state=state,
+                kv_cache=kv_cache,
+                current_start_frame=current_start_frame,
+            )
 
         # Copy the updated KV caches back to the original KV cache.
         x_video = x_video.clone()
         if action_noise_pred is not None:
             action_noise_pred = action_noise_pred.clone()
-        #for block_index, updated_kv_cache in enumerate(updated_kv_caches):
-        #    kv_cache[block_index] = updated_kv_cache.clone()
 
         video_noise_pred = self.unpatchify(x_video, grid_size)
 
@@ -2173,6 +2261,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if kwargs.get('kv_cache', None) is not None:
             return self._forward_inference(*args, **kwargs)
         else:
+            # Remove update_kv_cache if present (training doesn't use it)
+            kwargs.pop('update_kv_cache', None)
             return self._forward_train(*args, **kwargs)
 
     def unpatchify(self, x, grid_size):

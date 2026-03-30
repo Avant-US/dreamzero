@@ -900,6 +900,7 @@ class WANPolicyHead(ActionHead):
                     kv_cache=kv_cache,
                     crossattn_cache=crossattn_cache,
                     current_start_frame=kv_cache_metadata["start_frame"],
+                    update_kv_cache=kv_cache_metadata["update_kv_cache"],
                 )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
@@ -1383,7 +1384,17 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
-        
+
+        # Optionally compile DiT _forward_blocks for diffusion loop speedup
+        COMPILE_DIT = os.getenv("COMPILE_DIT", "False").lower() == "true"
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE and COMPILE_DIT:
+            print("Torch compiling DiT _forward_blocks_compiled (reduce-overhead mode).")
+            self.model._compiled_forward_blocks = torch.compile(
+                self.model._forward_blocks_compiled,
+                mode="reduce-overhead",
+                dynamic=False,
+            )
+
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
             print(f"Loading TRT engine from {LOAD_TRT_ENGINE}")
