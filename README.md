@@ -391,7 +391,7 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('GEA
 
 4. **Run container with 2 GPUs** (adjust device IDs as needed):
 ```bash
-sudo docker run --gpus '"device=6,7"' -it --rm \
+sudo docker run --name dreamzero_server --gpus '"device=6,7"' -it --rm \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
@@ -415,7 +415,7 @@ Note: `CUDA_VISIBLE_DEVICES=0,1` inside the container because Docker's `--gpus "
 
 6. **Test from a second shell:**
 ```bash
-sudo docker exec -it $(sudo docker ps -q) python test_client_AR.py --port 5000
+sudo docker exec -it dreamzero_server python test_client_AR.py --port 5000
 ```
 
 ### Performance Summary
@@ -476,7 +476,7 @@ docker build -t dreamzero .
 3. **Run container with 2 GPUs:**
 ```bash
 mkdir -p /dev/shm/huggingface_cache
-docker run --gpus '"device=0,1"' -it --rm \
+docker run --name dreamzero_server --gpus '"device=0,1"' -it --rm \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
@@ -504,7 +504,7 @@ DYNAMIC_CACHE_SCHEDULE=true \
 
 5. **Test from a second shell:**
 ```bash
-docker exec -it $(docker ps -q) python test_client_AR.py --port 5000
+docker exec -it dreamzero_server python test_client_AR.py --port 5000
 ```
 
 6. **(Optional) Build and run with TRT FP8 for maximum speed:**

@@ -1366,10 +1366,10 @@ class WANPolicyHead(ActionHead):
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
-        # Torch compile the modules. _forward_blocks uses fullgraph=False to handle
-        # shape variation (e.g. x [1,50,C] vs e [1,200,C]) and list ops in KV cache.
+        # Torch compile the modules. Skip _forward_blocks: dynamic KV cache shapes cause
+        # constant recompilation, and RoPE complex ops lack inductor codegen support.
         if not ENABLE_TENSORRT:
-            print("Torch compiling the TextEncoder, ImageEncoder, VAE, and DiT _forward_blocks modules.")
+            print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
             self.text_encoder.forward = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
@@ -1382,10 +1382,6 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
-
-            self.model._forward_blocks = torch.compile(
-                mode="reduce-overhead", fullgraph=False, dynamic=False,
-            )(self.model._forward_blocks)
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
