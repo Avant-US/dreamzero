@@ -1387,11 +1387,12 @@ class WANPolicyHead(ActionHead):
 
         # Optionally compile DiT _forward_blocks for diffusion loop speedup
         COMPILE_DIT = os.getenv("COMPILE_DIT", "False").lower() == "true"
+        COMPILE_DIT_MODE = os.getenv("COMPILE_DIT_MODE", "default")
         if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE and COMPILE_DIT:
-            print("Torch compiling DiT _forward_blocks_compiled (reduce-overhead mode).")
+            print(f"Torch compiling DiT _forward_blocks_compiled (mode={COMPILE_DIT_MODE}).")
             self.model._compiled_forward_blocks = torch.compile(
                 self.model._forward_blocks_compiled,
-                mode="reduce-overhead",
+                mode=COMPILE_DIT_MODE,
                 dynamic=False,
             )
 
