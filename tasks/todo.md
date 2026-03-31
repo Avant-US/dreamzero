@@ -213,3 +213,34 @@ CUDA_VISIBLE_DEVICES=0,1 \
 | 5. + TRT FP8 | + LOAD_TRT_ENGINE | 0.34s* | ~0.58s | |
 
 *GB200 only
+
+---
+
+## Optimization Experiments (branch: `dit-compile-static-kv-cache`, 2026-03-31)
+
+### Experiment 1: torch.compile on DiT (COMPILE_DIT=true)
+- **mode="default"** (kernel fusion): ~2.12s total — **2.2x REGRESSION**
+- **mode="reduce-overhead"** (CUDA graphs via compile): fails on mutated KV cache inputs
+- **Root cause:** DiT ops (flash attn, cuBLAS) are already hand-tuned; fusion adds
+  overhead without benefit. `dynamic=True` guard/dispatch overhead hurts.
+
+### Experiment 2: CUDA Graph Capture (ENABLE_CUDA_GRAPH=true)
+- **Result:** ~0.93s total, ~0.66s diffusion — **no meaningful speedup** (~2%, noise)
+- **Fixes required:** `torch.tensor([x]*b)` → `torch.full()`, `torch.tensor([0], device=cuda)`
+  → `torch.zeros()`, side-stream warmup → same-stream warmup (segfault fix)
+- **Root cause:** Kernel launch overhead is not the bottleneck. The DiT forward is
+  dominated by a few large kernels (flash attention, cuBLAS) taking ms each. With
+  ~100 kernels per forward, total launch overhead is ~0.5-1ms out of ~670ms (<0.2%).
+
+### Conclusion
+The 0.31s gap between our Step 3 (~0.95s) and the paper (0.64s) is NOT from
+torch.compile kernel fusion or CUDA graph launch overhead. The paper's "torch.compile
++ CUDA graphs" 1.6x gain likely involves:
+- Custom fused kernels not in the public release
+- Different attention implementation (e.g., fused QKV + RoPE + attention)
+- Architecture differences between internal and public code
+- Or the gain is measured on different hardware (GB200 vs H200)
+
+### What DID work
+- Static KV cache (pre-allocated tensor, in-place writes) — zero regression, cleaner code
+- `torch.full` / `torch.zeros` fixes — required for any future CUDA graph work

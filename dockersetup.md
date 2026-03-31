@@ -171,7 +171,6 @@ CUDA_VISIBLE_DEVICES=0 \
 | `ATTENTION_BACKEND` | `TE`, `FA2`, `FA3`, `torch` | `TE` | Attention kernel backend. Use TE on H200/GB200, FA2 on H100 |
 | `DYNAMIC_CACHE_SCHEDULE` | `true`, `false` | `false` | Cosine-similarity step skipping (16 -> ~4-5 effective steps) |
 | `DISABLE_TORCH_COMPILE` | `true`, `false` | `false` | Disable torch.compile on encoders/VAE/scheduler |
-| `COMPILE_DIT` | `true`, `false` | `false` | torch.compile DiT _forward_blocks with dynamic shapes |
 | `NUM_DIT_STEPS` | `5`,`6`,`7`,`8`,`16` | `8` | Base diffusion steps (before dynamic cache skipping) |
 | `LOAD_TRT_ENGINE` | path | unset | Load TensorRT FP8 engine for quantized diffusion |
 | `USE_POLAR_ROPE` | `true`, `false` | `false` | Use complex polar RoPE (slower, for training/debug) |
