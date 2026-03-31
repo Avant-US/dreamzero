@@ -1842,9 +1842,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if sp_active:
             original_total_len = x.shape[1]
             self.sp_ctx.original_seq_len = original_total_len
-            x = split_sequence(x, dim=1, sp_ctx=self.sp_ctx)
-            e0 = split_sequence(e0, dim=1, sp_ctx=self.sp_ctx)
-            e = split_sequence(e, dim=1, sp_ctx=self.sp_ctx)
+            # FP8 requires each chunk's sequence length to be divisible by 8
+            sp_alignment = 8 if getattr(self, 'fp8_inference', False) else 1
+            x = split_sequence(x, dim=1, sp_ctx=self.sp_ctx, alignment=sp_alignment)
+            e0 = split_sequence(e0, dim=1, sp_ctx=self.sp_ctx, alignment=sp_alignment)
+            e = split_sequence(e, dim=1, sp_ctx=self.sp_ctx, alignment=sp_alignment)
 
         updated_kv_caches: list[torch.Tensor] = []
         for block_index, block in enumerate(self.blocks):

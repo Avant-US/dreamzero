@@ -36,6 +36,8 @@ NUM_DIT_STEPS="${NUM_DIT_STEPS:-16}"
 PORT="${PORT:-5000}"
 SP_SIZE="${SP_SIZE:-1}"
 NUM_GPUS="${NUM_GPUS:-2}"
+LOAD_TRT_ENGINE="${LOAD_TRT_ENGINE:-}"
+FP8_INFERENCE="${FP8_INFERENCE:-false}"
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 cmd_build() {
@@ -82,9 +84,17 @@ cmd_start() {
     echo "    MODEL_PATH=${MODEL_PATH}"
     echo "    SP_SIZE=${SP_SIZE}"
     echo "    NUM_GPUS=${NUM_GPUS}"
+    echo "    LOAD_TRT_ENGINE=${LOAD_TRT_ENGINE:-<none>}"
+    echo "    FP8_INFERENCE=${FP8_INFERENCE}"
 
     # Build CUDA_VISIBLE_DEVICES list: 0,1,...,NUM_GPUS-1
     CUDA_DEVS=$(seq -s, 0 $((NUM_GPUS - 1)))
+
+    # Build optional TRT engine env var
+    TRT_ENV=""
+    if [ -n "${LOAD_TRT_ENGINE}" ]; then
+        TRT_ENV="LOAD_TRT_ENGINE=${LOAD_TRT_ENGINE}"
+    fi
 
     docker exec -it "${CONTAINER_NAME}" bash -c "\
         DYNAMIC_CACHE_SCHEDULE=${DYNAMIC_CACHE} \
@@ -93,6 +103,8 @@ cmd_start() {
         CUDA_GRAPH_DIT=${CUDA_GRAPH_DIT} \
         NUM_DIT_STEPS=${NUM_DIT_STEPS} \
         ATTENTION_BACKEND=${ATTENTION_BACKEND} \
+        FP8_INFERENCE=${FP8_INFERENCE} \
+        ${TRT_ENV} \
         CUDA_VISIBLE_DEVICES=${CUDA_DEVS} \
         torchrun --standalone --nproc_per_node=${NUM_GPUS} \
             socket_test_optimized_AR.py \

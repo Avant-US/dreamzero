@@ -18,15 +18,21 @@ class SequenceParallelContext:
     original_seq_len: int | None = None
 
 
-def split_sequence(tensor: torch.Tensor, dim: int, sp_ctx: SequenceParallelContext) -> torch.Tensor:
+def split_sequence(tensor: torch.Tensor, dim: int, sp_ctx: SequenceParallelContext,
+                   alignment: int = 1) -> torch.Tensor:
     """Split *tensor* along *dim* across SP ranks, returning the local chunk.
 
     If the dimension is not evenly divisible by sp_size, the tensor is padded
     with zeros before splitting and the caller must track the original length
     for later trimming.
+
+    *alignment*: each local chunk's size along *dim* will be a multiple of this
+    value.  For FP8, pass alignment=8 so that te.Linear gets valid shapes.
     """
     length = tensor.shape[dim]
-    pad_amount = (sp_ctx.sp_size - length % sp_ctx.sp_size) % sp_ctx.sp_size
+    # Pad to multiple of (sp_size * alignment) so each chunk is a multiple of alignment
+    chunk_alignment = sp_ctx.sp_size * alignment
+    pad_amount = (chunk_alignment - length % chunk_alignment) % chunk_alignment
     if pad_amount > 0:
         pad_sizes = [0] * (2 * tensor.ndim)
         # torch.nn.functional.pad uses (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)

@@ -330,14 +330,18 @@ Test input: 352×640 video, 15 chunks of 4 frames each, `DYNAMIC_CACHE_SCHEDULE=
 | SP=1 (baseline) | FA2 | 2 | 2 CFG | ~95s | 0.89–1.19s | 0.65–0.86s |
 | SP=2 | FA2 | 4 | 2 CFG × 2 SP | ~104s | 0.68–0.91s | 0.44–0.50s |
 | SP=4 | FA2 | 8 | 2 CFG × 4 SP | ~135s | 0.63–0.92s | 0.40–0.50s |
-| SP=4 | TE | 8 | 2 CFG × 4 SP | ~21s | **0.57–0.79s** | **0.40–0.50s** |
+| SP=4 | TE | 8 | 2 CFG × 4 SP | ~21s | 0.57–0.79s | 0.40–0.50s |
+| SP=4 + FP8 | TE FP8 | 8 | 2 CFG × 4 SP | ~57s | 0.74–1.00s | 0.53–0.67s |
+| **SP=4 + COMPILE_DIT** | **TE** | **8** | **2 CFG × 4 SP** | **~108s** | **0.47–0.75s** | **0.30–0.56s** |
 
 ### Analysis
 
 - **SP=2 (FA2)**: ~25% speedup over baseline on steady-state inference.
 - **SP=4 (FA2)**: ~32% speedup — diminishing returns suggest all-to-all communication competes with compute savings at this sequence length.
-- **SP=4 (TE)**: ~43% speedup over SP=1/FA2 baseline. TE's cuDNN attention backend reduces overhead vs FA2. Best config: **0.57s typical total, 0.40s diffusion**.
-- **Warmup**: Slower with more GPUs due to all-to-all collective initialization. TE warmup is dramatically faster (~21s vs ~135s for FA2) likely due to pre-compiled cuDNN kernels.
+- **SP=4 (TE)**: ~43% speedup over SP=1/FA2 baseline. TE's cuDNN attention backend reduces overhead vs FA2.
+- **SP=4 + FP8**: ~30% *slower* than TE BF16. FP8 scaling overhead dominates at the small per-GPU sequence length (~224 tokens). FP8 needs larger GEMMs to amortize scaling costs.
+- **SP=4 + COMPILE_DIT**: Best config. **~53% speedup** over SP=1/FA2 baseline. `torch.compile` with `mode="reduce-overhead"` and `dynamic=True` fuses the DiT block loop. Best: **0.47s total, 0.30s diffusion**. Tradeoff: first ~8 chunks are slow (~7-22s each) due to compilation/tracing of new shapes, then converges to fast steady-state.
+- **Warmup**: TE warmup is dramatically faster than FA2 (~21s vs ~135s) likely due to pre-compiled cuDNN kernels. COMPILE_DIT adds compilation warmup but amortizes over subsequent calls.
 - **Correctness**: Action output ranges are consistent across all configs. Formal numerical comparison (SP=1 vs SP=2 tensor diff) not yet done.
 
 ### Implementation Notes
@@ -346,10 +350,12 @@ Test input: 352×640 video, 15 chunks of 4 frames each, `DYNAMIC_CACHE_SCHEDULE=
 - `_exchange_predictions()` required no changes — after `gather_sequence`, all SP ranks have identical predictions, and the 2D mesh `ip_group` correctly pairs each SP rank with its CFG partner.
 - Cross-attention required no changes (Step 6 verified) — Q comes from local sequence, K/V from replicated context.
 - TE `DotProductAttention` works with SP despite being initialized with full `num_heads` — the cuDNN backend infers head count from tensor shapes at runtime.
+- FP8 via `te.Linear` + `fp8_autocast()` works but requires: (a) FP8 alignment padding (each SP chunk must be divisible by 8), (b) only replacing self-attention + FFN linear layers (not cross-attention, which has fixed 257-token CLIP context that doesn't meet alignment).
+- `COMPILE_DIT=true` + SP works with `dynamic=True` for KV cache shape changes. Empty CUDA graph warnings are harmless.
 
 ### Remaining Work
 
 1. **Correctness validation**: Numerical comparison of SP=1 vs SP=2 action outputs (tensor-level diff).
 2. **Memory profiling**: Per-GPU VRAM comparison via `nvidia-smi`.
-3. **`torch.compile` + SP**: Verify `COMPILE_DIT=true` works with all-to-all collectives.
-4. **Edge case testing**: Different frame counts and action horizons that stress padding logic.
+3. **Edge case testing**: Different frame counts and action horizons that stress padding logic.
+4. **SP=2 + FP8**: FP8 may help at SP=2 where per-GPU workload is larger (~448 tokens vs ~224).
