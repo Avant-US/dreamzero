@@ -367,6 +367,24 @@ Test input: 352×640 video, 15 chunks of 4 frames each, `DYNAMIC_CACHE_SCHEDULE=
 - TRT is incompatible with SP — TRT replaces the entire `_forward_blocks()` where SP collectives operate.
 - "KV Cache Creation" timing is actually DiT forward passes for reference frame encoding, not cache allocation. Already optimized by SP + COMPILE_DIT.
 
+### Production Deployment
+
+The best config (`SP=4 + TE + COMPILE_DIT`) requires a warmup phase before steady-state performance is reached. `torch.compile` with `mode="reduce-overhead"` traces and compiles new shapes on first encounter — the first ~8 inference chunks take 7-22s each as compilation happens, then all subsequent inferences run at ~0.5s.
+
+**Recommended startup procedure:**
+```bash
+# 1. Start the server
+NUM_GPUS=8 SP_SIZE=4 ATTENTION_BACKEND=TE COMPILE_DIT=true ./scripts/inference/docker_bench.sh start
+
+# 2. Run warmup (2 test episodes, ~3 min total)
+./scripts/inference/docker_bench.sh test   # first run: compiles all shapes
+./scripts/inference/docker_bench.sh test   # second run: verifies steady-state speed
+
+# 3. Connect the robot — all inferences will be ~0.5s
+```
+
+The compile cache is session-persistent — once warm, performance stays at ~0.5s across robot episodes until the server is restarted. If warmup time is unacceptable, use `SP=4 + TE` without `COMPILE_DIT` for 0.57s with no warmup penalty.
+
 ### Remaining Work
 
 1. **Correctness validation**: Numerical comparison of SP=1 vs SP=2 action outputs (tensor-level diff).
