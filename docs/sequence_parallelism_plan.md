@@ -329,20 +329,32 @@ Test input: 352×640 video, 15 chunks of 4 frames each, `DYNAMIC_CACHE_SCHEDULE=
 |--------|---------|------|--------|--------------------|--------------------|----------------|
 | SP=1 (baseline) | FA2 | 2 | 2 CFG | ~95s | 0.89–1.19s | 0.65–0.86s |
 | SP=2 | FA2 | 4 | 2 CFG × 2 SP | ~104s | 0.68–0.91s | 0.44–0.50s |
+| SP=2 + FP8 | TE FP8 | 4 | 2 CFG × 2 SP | ~43s | 0.73–1.13s | — |
 | SP=4 | FA2 | 8 | 2 CFG × 4 SP | ~135s | 0.63–0.92s | 0.40–0.50s |
 | SP=4 | TE | 8 | 2 CFG × 4 SP | ~21s | 0.57–0.79s | 0.40–0.50s |
 | SP=4 + FP8 | TE FP8 | 8 | 2 CFG × 4 SP | ~57s | 0.74–1.00s | 0.53–0.67s |
-| **SP=4 + COMPILE_DIT** | **TE** | **8** | **2 CFG × 4 SP** | **~108s** | **0.47–0.75s** | **0.30–0.56s** |
+| SP=4 + COMPILE_DIT | TE | 8 | 2 CFG × 4 SP | ~108s | **0.47–0.75s** | **0.30–0.56s** |
+| SP=8 (pure SP) | FA2 | 8 | 1 CFG × 8 SP | ~23s | 1.18–1.53s | 0.88–1.11s |
 
 ### Analysis
 
 - **SP=2 (FA2)**: ~25% speedup over baseline on steady-state inference.
 - **SP=4 (FA2)**: ~32% speedup — diminishing returns suggest all-to-all communication competes with compute savings at this sequence length.
 - **SP=4 (TE)**: ~43% speedup over SP=1/FA2 baseline. TE's cuDNN attention backend reduces overhead vs FA2.
-- **SP=4 + FP8**: ~30% *slower* than TE BF16. FP8 scaling overhead dominates at the small per-GPU sequence length (~224 tokens). FP8 needs larger GEMMs to amortize scaling costs.
+- **SP=4 + FP8**: ~30% *slower* than TE BF16. FP8 scaling overhead dominates at the small per-GPU sequence length (~224 tokens). FP8 needs larger GEMMs to amortize scaling costs. SP=2 + FP8 (~0.80s) is slightly better than SP=4 + FP8 (~0.76s) due to larger per-GPU workload (~448 tokens), but still slower than SP=4 TE BF16 (0.57s).
 - **SP=4 + COMPILE_DIT**: Best config. **~53% speedup** over SP=1/FA2 baseline. `torch.compile` with `mode="reduce-overhead"` and `dynamic=True` fuses the DiT block loop. Best: **0.47s total, 0.30s diffusion**. Tradeoff: first ~8 chunks are slow (~7-22s each) due to compilation/tracing of new shapes, then converges to fast steady-state.
+- **SP=8 (pure SP, no CFG)**: Much slower than SP=4 with CFG. Without CFG parallelism (`cfg_size=1`), conditional and unconditional passes run sequentially, doubling diffusion time. SP=8 only makes sense with 16+ GPUs (`cfg_size=2, sp_size=8`).
 - **Warmup**: TE warmup is dramatically faster than FA2 (~21s vs ~135s) likely due to pre-compiled cuDNN kernels. COMPILE_DIT adds compilation warmup but amortizes over subsequent calls.
 - **Correctness**: Action output ranges are consistent across all configs. Formal numerical comparison (SP=1 vs SP=2 tensor diff) not yet done.
+
+### Comparison with Prior Results (from README)
+
+| Setup | Avg Inference | Notes |
+|-------|-------------|-------|
+| 2x H200 (TE + CFG, no SP) | ~0.87s | Previous best without SP |
+| 2x H200 (TRT FP8 + CFG) | ~0.58s | Previous best with TRT |
+| **8x H200 (SP=4 + TE + COMPILE_DIT)** | **~0.50s** | **New best — no TRT needed** |
+| Paper GB200 (NVFP4, 16.6x) | ~0.34s | Paper's best with quantization |
 
 ### Implementation Notes
 
@@ -352,10 +364,11 @@ Test input: 352×640 video, 15 chunks of 4 frames each, `DYNAMIC_CACHE_SCHEDULE=
 - TE `DotProductAttention` works with SP despite being initialized with full `num_heads` — the cuDNN backend infers head count from tensor shapes at runtime.
 - FP8 via `te.Linear` + `fp8_autocast()` works but requires: (a) FP8 alignment padding (each SP chunk must be divisible by 8), (b) only replacing self-attention + FFN linear layers (not cross-attention, which has fixed 257-token CLIP context that doesn't meet alignment).
 - `COMPILE_DIT=true` + SP works with `dynamic=True` for KV cache shape changes. Empty CUDA graph warnings are harmless.
+- TRT is incompatible with SP — TRT replaces the entire `_forward_blocks()` where SP collectives operate.
+- "KV Cache Creation" timing is actually DiT forward passes for reference frame encoding, not cache allocation. Already optimized by SP + COMPILE_DIT.
 
 ### Remaining Work
 
 1. **Correctness validation**: Numerical comparison of SP=1 vs SP=2 action outputs (tensor-level diff).
 2. **Memory profiling**: Per-GPU VRAM comparison via `nvidia-smi`.
 3. **Edge case testing**: Different frame counts and action horizons that stress padding logic.
-4. **SP=2 + FP8**: FP8 may help at SP=2 where per-GPU workload is larger (~448 tokens vs ~224).
