@@ -202,6 +202,7 @@ class WANPolicyHead(ActionHead):
         self.ip_rank = 0
         self.ip_size = 1
         self.ip_group = None
+        self.sp_ctx = None
         
         self._device = "cuda"
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
@@ -494,14 +495,17 @@ class WANPolicyHead(ActionHead):
         """
         num_heads = self.model.num_heads
         head_dim = self.model.dim // num_heads
+        # With SP, each rank only stores H/sp heads in the KV cache (post all-to-all layout)
+        sp_size = self.sp_ctx.sp_size if self.sp_ctx is not None else 1
+        effective_num_heads = num_heads // sp_size
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
             kv_cache1.append(
-                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, effective_num_heads, head_dim], dtype=dtype, device=device),
             )
             kv_cache_neg.append(
-                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, effective_num_heads, head_dim], dtype=dtype, device=device),
             )
 
         return kv_cache1, kv_cache_neg
@@ -1409,6 +1413,18 @@ class WANPolicyHead(ActionHead):
 
         assert self.ip_size == 1 or self.ip_size == 2, "ip_size must be 1 or 2"
         assert self.ip_rank >= 0 and self.ip_rank < self.ip_size, "ip_rank must be in [0, ip_size)"
+
+        if "sp" in device_mesh.mesh_dim_names:
+            from groot.vla.model.dreamzero.modules.sequence_parallel import SequenceParallelContext
+            sp_mesh = device_mesh["sp"]
+            self.sp_ctx = SequenceParallelContext(
+                sp_group=sp_mesh.get_group(),
+                sp_rank=sp_mesh.get_local_rank(),
+                sp_size=sp_mesh.size(),
+            )
+        else:
+            self.sp_ctx = None
+        self.model.set_sp_context(self.sp_ctx)
 
     @property
     def device(self):

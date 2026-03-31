@@ -1,5 +1,11 @@
 from typing import Any, TypeAlias
 
+from groot.vla.model.dreamzero.modules.sequence_parallel import (
+    SequenceParallelContext,
+    all_to_all,
+    gather_sequence,
+    split_sequence,
+)
 from groot.vla.model.dreamzero.modules.wan2_1_attention import AttentionModule
 from groot.vla.model.n1_5.modules.action_encoder import (
     SinusoidalPositionalEncoding,
@@ -225,6 +231,7 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim)
         self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
+        self.sp_ctx = None  # Set by CausalWanModel.set_sp_context()
 
     def _visualize_attention_mask(self, total_len, first_image_len, image_blocks_len, 
                                    action_len, state_len, num_image_blocks, 
@@ -815,6 +822,23 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        # Ulysses SP: swap from [B, S_local, H, D] to [B, S_full, H/sp, D]
+        sp_active = self.sp_ctx is not None and self.sp_ctx.sp_size > 1
+        sp_padded_len = 0  # track padded full length for re-padding before reverse all-to-all
+        if sp_active:
+            q = all_to_all(q, scatter_dim=2, gather_dim=1, sp_ctx=self.sp_ctx)
+            k = all_to_all(k, scatter_dim=2, gather_dim=1, sp_ctx=self.sp_ctx)
+            v = all_to_all(v, scatter_dim=2, gather_dim=1, sp_ctx=self.sp_ctx)
+            # Trim padding tokens added by split_sequence (if seq was not divisible by sp_size)
+            sp_padded_len = q.shape[1]
+            orig_len = self.sp_ctx.original_seq_len
+            if orig_len is not None and sp_padded_len > orig_len:
+                q = q[:, :orig_len]
+                k = k[:, :orig_len]
+                v = v[:, :orig_len]
+            s = q.shape[1]  # S_full (original, unpadded)
+            n = q.shape[2]  # H / sp_size
+
         updated_kv_cache: torch.Tensor | None = None
 
         if kv_cache is None:
@@ -1090,6 +1114,14 @@ class CausalWanSelfAttention(nn.Module):
                 )
             updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
+
+        # Ulysses SP: swap back from [B, S_full, H/sp, D] to [B, S_local, H, D]
+        if sp_active:
+            # Re-pad to the padded length so scatter_dim=1 is divisible by sp_size
+            if sp_padded_len > x.shape[1]:
+                pad = sp_padded_len - x.shape[1]
+                x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
+            x = all_to_all(x, scatter_dim=1, gather_dim=2, sp_ctx=self.sp_ctx)
 
         # output
         x = x.flatten(2)
@@ -1429,7 +1461,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         self.gradient_checkpointing = True
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
+        self.sp_ctx = None
 
+
+    def set_sp_context(self, sp_ctx):
+        """Propagate sequence parallelism context to all self-attention layers."""
+        self.sp_ctx = sp_ctx
+        if sp_ctx is not None:
+            for block in self.blocks:
+                block.self_attn.sp_ctx = sp_ctx
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -1797,6 +1837,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             clip_embedding = self.img_emb(clip_feature)
             context = torch.cat([clip_embedding, context], dim=1)
 
+        # Sequence parallelism: split x and e0 along sequence dim before blocks
+        sp_active = self.sp_ctx is not None and self.sp_ctx.sp_size > 1
+        if sp_active:
+            original_total_len = x.shape[1]
+            self.sp_ctx.original_seq_len = original_total_len
+            x = split_sequence(x, dim=1, sp_ctx=self.sp_ctx)
+            e0 = split_sequence(e0, dim=1, sp_ctx=self.sp_ctx)
+            e = split_sequence(e, dim=1, sp_ctx=self.sp_ctx)
+
         updated_kv_caches: list[torch.Tensor] = []
         for block_index, block in enumerate(self.blocks):
             x, updated_kv_cache = block(
@@ -1811,6 +1860,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 current_start_frame=current_start_frame,
             )
             updated_kv_caches.append(updated_kv_cache)
+
+        # Sequence parallelism: gather x and e back to full sequence before output extraction
+        if sp_active:
+            x = gather_sequence(x, dim=1, sp_ctx=self.sp_ctx, original_length=original_total_len)
+            e = gather_sequence(e, dim=1, sp_ctx=self.sp_ctx, original_length=original_total_len)
 
         if action is not None:
             action_noise_pred = x[:, seq_len: seq_len + action_length]

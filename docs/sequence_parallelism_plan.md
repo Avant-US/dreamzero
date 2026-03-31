@@ -318,3 +318,38 @@ Steps 4, 5, 7 can be developed in parallel once Step 3 is done.
 2. **Latency**: Benchmark denoising loop time with SP=1 vs SP=2 vs SP=4.
 3. **Memory**: Check per-GPU VRAM usage — should decrease with SP (smaller KV cache, smaller activations).
 4. **Edge cases**: Test with action horizon and frame sizes that don't divide evenly by `sp_size`.
+
+## Benchmark Results (2026-03-31, H200 8-GPU node)
+
+Test input: 352×640 video, 15 chunks of 4 frames each, `DYNAMIC_CACHE_SCHEDULE=true`, `--enable-dit-cache`.
+
+### Latency
+
+| Config | Backend | GPUs | Layout | Warmup (1st call) | Steady-state total | Diffusion time |
+|--------|---------|------|--------|--------------------|--------------------|----------------|
+| SP=1 (baseline) | FA2 | 2 | 2 CFG | ~95s | 0.89–1.19s | 0.65–0.86s |
+| SP=2 | FA2 | 4 | 2 CFG × 2 SP | ~104s | 0.68–0.91s | 0.44–0.50s |
+| SP=4 | FA2 | 8 | 2 CFG × 4 SP | ~135s | 0.63–0.92s | 0.40–0.50s |
+| SP=4 | TE | 8 | 2 CFG × 4 SP | ~21s | **0.57–0.79s** | **0.40–0.50s** |
+
+### Analysis
+
+- **SP=2 (FA2)**: ~25% speedup over baseline on steady-state inference.
+- **SP=4 (FA2)**: ~32% speedup — diminishing returns suggest all-to-all communication competes with compute savings at this sequence length.
+- **SP=4 (TE)**: ~43% speedup over SP=1/FA2 baseline. TE's cuDNN attention backend reduces overhead vs FA2. Best config: **0.57s typical total, 0.40s diffusion**.
+- **Warmup**: Slower with more GPUs due to all-to-all collective initialization. TE warmup is dramatically faster (~21s vs ~135s for FA2) likely due to pre-compiled cuDNN kernels.
+- **Correctness**: Action output ranges are consistent across all configs. Formal numerical comparison (SP=1 vs SP=2 tensor diff) not yet done.
+
+### Implementation Notes
+
+- Odd sequence lengths (e.g., 1785 tokens) required a pad/trim fix around the all-to-all to prevent RoPE frequency mismatch.
+- `_exchange_predictions()` required no changes — after `gather_sequence`, all SP ranks have identical predictions, and the 2D mesh `ip_group` correctly pairs each SP rank with its CFG partner.
+- Cross-attention required no changes (Step 6 verified) — Q comes from local sequence, K/V from replicated context.
+- TE `DotProductAttention` works with SP despite being initialized with full `num_heads` — the cuDNN backend infers head count from tensor shapes at runtime.
+
+### Remaining Work
+
+1. **Correctness validation**: Numerical comparison of SP=1 vs SP=2 action outputs (tensor-level diff).
+2. **Memory profiling**: Per-GPU VRAM comparison via `nvidia-smi`.
+3. **`torch.compile` + SP**: Verify `COMPILE_DIT=true` works with all-to-all collectives.
+4. **Edge case testing**: Different frame counts and action horizons that stress padding logic.
