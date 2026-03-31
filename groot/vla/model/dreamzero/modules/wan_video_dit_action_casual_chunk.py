@@ -1723,6 +1723,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         return block_mask
 
+    def compute_context_embedding(
+        self,
+        context: torch.Tensor,
+        clip_feature: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Pre-compute the context embedding (text + optional CLIP) for reuse across denoising steps."""
+        context = self.text_embedding(context)
+        if clip_feature is not None:
+            clip_embedding = self.img_emb(clip_feature)
+            context = torch.cat([clip_embedding, context], dim=1)
+        return context
+
     def _forward_blocks(
         self,
         x: torch.Tensor,
@@ -1737,6 +1749,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         state: torch.Tensor | None,
         kv_cache: list[torch.Tensor],
         current_start_frame: int,
+        context_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         r"""
         Forward pass through the diffusion model blocks.
@@ -1781,12 +1794,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         e0 = self.time_projection(e)
         e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
 
-        # context
-        context = self.text_embedding(context)
-        
-        if clip_feature is not None:
-            clip_embedding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embedding, context], dim=1)
+        # context: use cached embedding if provided, otherwise compute
+        if context_embedding is not None:
+            context = context_embedding
+        else:
+            context = self.text_embedding(context)
+            if clip_feature is not None:
+                clip_embedding = self.img_emb(clip_feature)
+                context = torch.cat([clip_embedding, context], dim=1)
 
         updated_kv_caches: list[torch.Tensor] = []
         for block_index, block in enumerate(self.blocks):
@@ -1832,6 +1847,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         state: torch.Tensor,
         kv_cache: list[torch.Tensor],
         current_start_frame: int,
+        context_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward blocks optimized for torch.compile (inference diffusion loop only).
 
@@ -1864,10 +1880,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         e0 = self.time_projection(e)
         e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
 
-        # Context (clip always present for i2v)
-        context = self.text_embedding(context)
-        clip_embedding = self.img_emb(clip_feature)
-        context = torch.cat([clip_embedding, context], dim=1)
+        # Context: use cached embedding if provided, otherwise compute
+        if context_embedding is not None:
+            context = context_embedding
+        else:
+            context = self.text_embedding(context)
+            clip_embedding = self.img_emb(clip_feature)
+            context = torch.cat([clip_embedding, context], dim=1)
 
         # Block loop (no KV cache collection needed)
         for block_index, block in enumerate(self.blocks):
@@ -1990,6 +2009,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         state=None,
         embodiment_id=None,
         update_kv_cache: bool = True,
+        context_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         r"""
         Run the diffusion model with kv caching.
@@ -2060,6 +2080,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 state=state,
                 kv_cache=kv_cache,
                 current_start_frame=current_start_frame,
+                context_embedding=context_embedding,
             )
             updated_kv_caches = kv_cache  # unchanged
         else:
@@ -2076,6 +2097,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 state=state,
                 kv_cache=kv_cache,
                 current_start_frame=current_start_frame,
+                context_embedding=context_embedding,
             )
 
         # Copy the updated KV caches back to the original KV cache.

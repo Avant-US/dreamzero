@@ -864,11 +864,13 @@ class WANPolicyHead(ActionHead):
         kv_caches: list[KVCacheType],
         crossattn_caches: list[KVCacheType],
         kv_cache_metadata: dict[str, bool | int],
+        context_embeddings: list[torch.Tensor] | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         predictions = []
         for index, prompt_emb in enumerate(context):
             kv_cache = kv_caches[index]
             crossattn_cache = crossattn_caches[index]
+            ctx_emb = context_embeddings[index] if context_embeddings is not None else None
             if not kv_cache_metadata["update_kv_cache"] and self.trt_engine is not None:
                 obs_noise_pred, action_noise_pred = self.trt_engine(
                     noisy_input,
@@ -901,6 +903,7 @@ class WANPolicyHead(ActionHead):
                     crossattn_cache=crossattn_cache,
                     current_start_frame=kv_cache_metadata["start_frame"],
                     update_kv_cache=kv_cache_metadata["update_kv_cache"],
+                    context_embedding=ctx_emb,
                 )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
@@ -981,17 +984,30 @@ class WANPolicyHead(ActionHead):
     def lazy_joint_video_action(self, backbone_output: BatchFeature, action_input: BatchFeature, latent_video: torch.Tensor | None = None) -> BatchFeature:
         start_time = time.perf_counter()
 
-        # Tracking time taken on GPU for various operations.
-        start_text_encoder_event = torch.cuda.Event(enable_timing=True)
-        end_text_encoder_event = torch.cuda.Event(enable_timing=True)
-        start_image_encoder_event = torch.cuda.Event(enable_timing=True)
-        end_image_encoder_event = torch.cuda.Event(enable_timing=True)
-        start_vae_event = torch.cuda.Event(enable_timing=True)
-        end_vae_event = torch.cuda.Event(enable_timing=True)
-        start_kv_event = torch.cuda.Event(enable_timing=True)
-        end_kv_event = torch.cuda.Event(enable_timing=True)
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
+        # Reuse CUDA timing events across calls instead of allocating new ones
+        if not hasattr(self, '_timing_events'):
+            self._timing_events = {
+                'start_text_encoder': torch.cuda.Event(enable_timing=True),
+                'end_text_encoder': torch.cuda.Event(enable_timing=True),
+                'start_image_encoder': torch.cuda.Event(enable_timing=True),
+                'end_image_encoder': torch.cuda.Event(enable_timing=True),
+                'start_vae': torch.cuda.Event(enable_timing=True),
+                'end_vae': torch.cuda.Event(enable_timing=True),
+                'start_kv': torch.cuda.Event(enable_timing=True),
+                'end_kv': torch.cuda.Event(enable_timing=True),
+                'start_diffusion': [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)],
+                'end_diffusion': [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)],
+            }
+        start_text_encoder_event = self._timing_events['start_text_encoder']
+        end_text_encoder_event = self._timing_events['end_text_encoder']
+        start_image_encoder_event = self._timing_events['start_image_encoder']
+        end_image_encoder_event = self._timing_events['end_image_encoder']
+        start_vae_event = self._timing_events['start_vae']
+        end_vae_event = self._timing_events['end_vae']
+        start_kv_event = self._timing_events['start_kv']
+        end_kv_event = self._timing_events['end_kv']
+        start_diffusion_events = self._timing_events['start_diffusion']
+        end_diffusion_events = self._timing_events['end_diffusion']
 
         self.set_frozen_modules_to_eval_mode()
         data = action_input 
@@ -1204,14 +1220,18 @@ class WANPolicyHead(ActionHead):
 
         # Step 3.1: Spatial denoising loop
 
-        sample_scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=self.scheduler.num_train_timesteps,
-            shift=1,
-            use_dynamic_shifting=False)
-        sample_scheduler_action = FlowUniPCMultistepScheduler(
-            num_train_timesteps=self.scheduler.num_train_timesteps,
-            shift=1,
-            use_dynamic_shifting=False)
+        # Cache scheduler instances instead of creating new ones each call
+        if not hasattr(self, '_sample_scheduler'):
+            self._sample_scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.scheduler.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False)
+            self._sample_scheduler_action = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.scheduler.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False)
+        sample_scheduler = self._sample_scheduler
+        sample_scheduler_action = self._sample_scheduler_action
         sample_scheduler.set_timesteps(
             self.num_inference_steps, device=noise_obs.device, shift=self.sigma_shift)
         sample_scheduler_action.set_timesteps(
@@ -1229,38 +1249,55 @@ class WANPolicyHead(ActionHead):
             if self.ip_rank == 0:
                 print(f"Decoupled inference: video sigmas {sigma_max:.3f} -> {sample_scheduler.sigmas[-1].item():.3f}")
 
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        prev_predictions = [] 
+        prev_predictions = []
         self.skip_countdown = 0
         dit_compute_steps = 0
+
+        # Pre-allocate timestep tensors and reuse via fill_()
+        timestep = torch.empty(
+            [batch_size, self.num_frame_per_block],
+            device=noise_obs.device,
+            dtype=torch.int64,
+        )
+        timestep_action = torch.empty(
+            [batch_size, self.action_horizon],
+            device=noise_obs.device,
+            dtype=torch.int64,
+        )
+
+        # Hoist loop-invariant y tensor out of denoising loop
+        if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+            y_loop = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+        else:
+            y_loop = self.ys[:, :, -self.num_frame_per_block:]
+
+        # Hoist loop-invariant kv_cache_metadata dict
+        kv_cache_metadata_loop = dict(
+            start_frame=self.current_start_frame,
+            update_kv_cache=False,
+        )
+
+        # Pre-compute context embeddings before denoising loop
+        context_embeddings = [
+            self.model.compute_context_embedding(prompt_emb, self.clip_feas)
+            for prompt_emb in prompt_embs
+        ]
+
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
             # Get timesteps from respective schedulers
-            action_timestep = sample_scheduler_action.timesteps[index]
+            action_timestep_val = sample_scheduler_action.timesteps[index]
             video_timestep = sample_scheduler.timesteps[index]  # Already rescaled if decoupled
 
-            # set current timestep
-            timestep = torch.ones(
-                [batch_size, self.num_frame_per_block],
-                device=noise_obs.device,
-                dtype=torch.int64,
-            ) * video_timestep
-            timestep_action = torch.ones(
-                [batch_size, self.action_horizon],
-                device=noise_obs.device,
-                dtype=torch.int64,
-            ) * action_timestep
+            # Reuse pre-allocated timestep tensors via fill_()
+            timestep.fill_(video_timestep)
+            timestep_action.fill_(action_timestep_val)
 
             # check if we need to run the DIT step
             should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
             if should_run_model:
                 dit_compute_steps += 1
-                if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
-                    y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
-                else:
-                    y = self.ys[:, :, -self.num_frame_per_block:]
                 predictions = self._run_diffusion_steps(
                     noisy_input=noisy_input.transpose(1, 2),
                     timestep=timestep,
@@ -1270,14 +1307,12 @@ class WANPolicyHead(ActionHead):
                     embodiment_id=embodiment_id,
                     context=prompt_embs,
                     seq_len=seq_len,
-                    y=y,
+                    y=y_loop,
                     clip_feature=self.clip_feas,
                     kv_caches=kv_caches,
                     crossattn_caches=crossattn_caches,
-                    kv_cache_metadata=dict(
-                        start_frame=self.current_start_frame,
-                        update_kv_cache=False,
-                    ),
+                    kv_cache_metadata=kv_cache_metadata_loop,
+                    context_embeddings=context_embeddings,
                 )
                 flow_pred_cond, flow_pred_cond_action = predictions[0]
                 flow_pred_uncond, flow_pred_uncond_action = predictions[1]
@@ -1306,7 +1341,7 @@ class WANPolicyHead(ActionHead):
             # Action: always fully denoises with standard schedule (1000->0)
             noisy_input_action = sample_scheduler_action.step(
                 model_output=flow_pred_cond_action,
-                timestep=action_timestep,
+                timestep=action_timestep_val,
                 sample=noisy_input_action,
                 step_index=index,
                 return_dict=False,
