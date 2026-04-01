@@ -38,6 +38,8 @@ SP_SIZE="${SP_SIZE:-1}"
 NUM_GPUS="${NUM_GPUS:-2}"
 LOAD_TRT_ENGINE="${LOAD_TRT_ENGINE:-}"
 FP8_INFERENCE="${FP8_INFERENCE:-false}"
+RTC_GUIDANCE_WEIGHT="${RTC_GUIDANCE_WEIGHT:-10.0}"
+RTC_SCHEDULE="${RTC_SCHEDULE:-LINEAR}"
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 cmd_build() {
@@ -86,6 +88,8 @@ cmd_start() {
     echo "    NUM_GPUS=${NUM_GPUS}"
     echo "    LOAD_TRT_ENGINE=${LOAD_TRT_ENGINE:-<none>}"
     echo "    FP8_INFERENCE=${FP8_INFERENCE}"
+    echo "    RTC_GUIDANCE_WEIGHT=${RTC_GUIDANCE_WEIGHT}"
+    echo "    RTC_SCHEDULE=${RTC_SCHEDULE}"
 
     # Build CUDA_VISIBLE_DEVICES list: 0,1,...,NUM_GPUS-1
     CUDA_DEVS=$(seq -s, 0 $((NUM_GPUS - 1)))
@@ -104,6 +108,8 @@ cmd_start() {
         NUM_DIT_STEPS=${NUM_DIT_STEPS} \
         ATTENTION_BACKEND=${ATTENTION_BACKEND} \
         FP8_INFERENCE=${FP8_INFERENCE} \
+        RTC_GUIDANCE_WEIGHT=${RTC_GUIDANCE_WEIGHT} \
+        RTC_SCHEDULE=${RTC_SCHEDULE} \
         ${TRT_ENV} \
         CUDA_VISIBLE_DEVICES=${CUDA_DEVS} \
         torchrun --standalone --nproc_per_node=${NUM_GPUS} \
