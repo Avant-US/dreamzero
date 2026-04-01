@@ -39,6 +39,7 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    sp_size: int = 1  # Sequence parallelism degree. Must divide world_size and num_heads (40).
 
 
 class ARDroidRoboarenaPolicy:
@@ -711,7 +712,7 @@ class WebsocketPolicyServer:
             # (or implement proper shutdown if needed)
 
 
-def init_mesh() -> DeviceMesh:
+def init_mesh(sp_size: int = 1) -> DeviceMesh:
     # env vars set by torchrun
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -721,12 +722,21 @@ def init_mesh() -> DeviceMesh:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
 
-    mesh = init_device_mesh(
-        device_type="cuda",
-        mesh_shape=(world_size, ),
-        mesh_dim_names=("ip", ),
-    )
-    print(f"Rank {rank}/{world_size} (PID: {os.getpid()}) using device {device}")
+    if sp_size > 1:
+        assert world_size % sp_size == 0, f"world_size ({world_size}) must be divisible by sp_size ({sp_size})"
+        cfg_size = world_size // sp_size
+        mesh = init_device_mesh(
+            device_type="cuda",
+            mesh_shape=(cfg_size, sp_size),
+            mesh_dim_names=("ip", "sp"),
+        )
+    else:
+        mesh = init_device_mesh(
+            device_type="cuda",
+            mesh_shape=(world_size, ),
+            mesh_dim_names=("ip", ),
+        )
+    print(f"Rank {rank}/{world_size} (PID: {os.getpid()}) using device {device}, sp_size={sp_size}")
 
     return mesh
 
@@ -757,7 +767,7 @@ def main(args: Args) -> None:
         "model_path": model_path,
     }
 
-    device_mesh = init_mesh()
+    device_mesh = init_mesh(sp_size=args.sp_size)
     rank = dist.get_rank()
 
     timeout_delta = datetime.timedelta(seconds=args.timeout_seconds)

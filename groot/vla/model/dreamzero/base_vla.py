@@ -506,7 +506,10 @@ class VLA(PreTrainedModel):
         from safetensors.torch import load_file
         import os
         import json
+        import torch
         print("loading pretrained@@@@@")
+        # Load directly to current CUDA device to skip CPU→GPU copy
+        cuda_device = f"cuda:{torch.cuda.current_device()}"
         # Check for different checkpoint formats
         safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
         safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
@@ -515,21 +518,21 @@ class VLA(PreTrainedModel):
         if os.path.exists(safetensors_index_path):
             # Handle sharded safetensors
             print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-            
+
             with open(safetensors_index_path, 'r') as f:
                 index = json.load(f)
-            
-            # Load each shard
+
+            # Load each shard directly to GPU
             for shard_file in set(index["weight_map"].values()):
                 shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
                 print(f"Loading shard: {shard_path}")
-                shard_state_dict = load_file(shard_path)
+                shard_state_dict = load_file(shard_path, device=cuda_device)
                 state_dict.update(shard_state_dict)
-                
+
         elif os.path.exists(safetensors_path):
             # Handle single safetensors file
             print(f"Loading weights from safetensors: {safetensors_path}")
-            state_dict.update(load_file(safetensors_path))
+            state_dict.update(load_file(safetensors_path, device=cuda_device))
         
         # Load config
         print("loading config@@")

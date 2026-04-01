@@ -579,18 +579,126 @@ Note: TRT on H200 requires disabling the CPU offloading code (designed for H100'
 
 **Table 12: All hardware comparison**
 
-| Setup | Avg Inference | Diffusion | VRAM/GPU | No OOM |
+| Setup | Avg Inference | Diffusion | GPUs | VRAM/GPU |
 |---|---|---|---|---|
-| Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 80GB | Yes |
-| 2x H100 (FA2 + CFG) | ~1.0s | 0.6 – 0.9s | 80GB | Yes |
-| 2x H100 (TRT + CFG) | OOM | — | 80GB | No |
-| 2x H200 (FA2 + CFG) | ~0.93s | 0.58 – 0.88s | 141GB | Yes |
-| 2x H200 (TE + CFG) | ~0.87s | 0.54 – 0.78s | 141GB | Yes |
-| **2x H200 (TRT FP8 + CFG)** | **~0.58s** | **0.27 – 0.38s** | **141GB** | **Yes** |
-| Paper H100 (9.6x, no quant) | ~0.6s | — | 80GB | Yes |
-| Paper GB200 (16.6x, NVFP4) | ~0.34s | — | 192GB | Yes |
+| Single H100 PCIe (FA2) | ~2.6s | 1.7 – 2.6s | 1 | 80GB |
+| 2x H100 (FA2 + CFG) | ~1.0s | 0.6 – 0.9s | 2 | 80GB |
+| 2x H100 (TRT + CFG) | OOM | — | 2 | 80GB |
+| 2x H200 (FA2 + CFG) | ~0.93s | 0.58 – 0.88s | 2 | 141GB |
+| 2x H200 (TE + CFG) | ~0.87s | 0.54 – 0.78s | 2 | 141GB |
+| 2x H200 (TRT FP8 + CFG) | ~0.58s | 0.27 – 0.38s | 2 | 141GB |
+| 8x H200 (SP=4 + TE) | ~0.57s | 0.40 – 0.50s | 8 | 141GB |
+| **8x H200 (SP=4 + TE + COMPILE_DIT)** | **~0.50s** | **0.30 – 0.56s** | **8** | **141GB** |
+| Paper H100 (9.6x, no quant) | ~0.6s | — | 2 | 80GB |
+| Paper GB200 (16.6x, NVFP4) | ~0.34s | — | 2 | 192GB |
 
 **2x H200 with TE + CFG parallelism achieves ~0.87s avg (~0.84s on 4-step inferences), with diffusion time (~0.58s) matching the paper's H100 total of ~0.59s.** The remaining gap is non-diffusion overhead (KV cache, VAE, scheduling). With TRT FP8, total drops to ~0.58s, matching the paper. The paper's GB200 with NVFP4 achieves ~0.34s (16.6x), so there's still a ~1.7x gap to match GB200. The key enabler for TRT on H200 is the 141GB VRAM — enough for TRT engine (15.5GB) + PyTorch DiT (~28GB) + KV cache + other models to coexist on each GPU without offloading.
+
+### Step-by-Step Optimization Isolation (2x H200)
+
+To understand each optimization's contribution, we measured each step in isolation against the paper's Table 1 cumulative speedups:
+
+**Table 13: Paper Table 1 reproduction on 2x H200**
+
+| Step | Config | Paper H100 | Our 2x H200 | Delta |
+|---|---|---|---|---|
+| 1. CFG Only | 2 GPU, 16 steps, no cache, no compile, FA2 | 3.0s | ~2.88s | -4% (H200 faster) |
+| 2. + DiT Caching | + DYNAMIC_CACHE_SCHEDULE=true | 1.04s | ~1.03s | matches paper |
+| 3. + Torch Compile | + encoder/VAE compile (not DiT) | 0.64s | ~0.95s | +48% (missing DiT compile) |
+| 4. + TE Attention | + ATTENTION_BACKEND=TE | 0.59s | ~0.87s | +47% |
+| 5. + TRT FP8 | + LOAD_TRT_ENGINE | 0.34s* | ~0.58s | GB200 only* |
+
+Key findings:
+- **Steps 1-2 match the paper exactly** — CFG parallelism (2.88s vs 3.0s) and DiT caching (1.03s vs 1.04s) reproduce well.
+- **Step 3 gap (0.95s vs 0.64s)**: The paper's 1.6x gain from "torch.compile + CUDA graphs" includes DiT compilation that we cannot reproduce with the public code. Our compile only covers encoders/VAE (~8% gain). See "Optimization Experiments" below.
+
+### Optimization Experiments: torch.compile and CUDA Graphs on DiT
+
+We investigated the 0.31s gap between our Step 3 (~0.95s) and the paper's (0.64s):
+
+**Experiment 1: torch.compile on DiT (`COMPILE_DIT=true`)**
+- `mode="default"` (kernel fusion): ~2.12s total — **2.2x REGRESSION**. DiT ops (flash attn, cuBLAS) are already hand-tuned; compile fusion adds overhead.
+- `mode="reduce-overhead"` (CUDA graphs via compile): fails on mutated KV cache inputs.
+
+**Experiment 2: CUDA Graph Capture (`CUDA_GRAPH_DIT=true`)**
+- Result: ~0.93s total, ~0.66s diffusion — **no meaningful speedup** (~2%, noise).
+- Kernel launch overhead is not the bottleneck. The DiT forward is dominated by a few large kernels (flash attention, cuBLAS) taking ms each. With ~100 kernels per forward, total launch overhead is ~0.5-1ms out of ~670ms (<0.2%).
+
+**Conclusion:** The paper's "torch.compile + CUDA graphs" 1.6x gain likely involves custom fused kernels, a different attention implementation, or architecture differences not present in the public release.
+
+## Inference using 8x H200 with Sequence Parallelism (Avant)
+
+Sequence parallelism (SP) splits the attention computation across multiple GPUs within each CFG branch using Ulysses-style all-to-all collectives. This is orthogonal to CFG parallelism and allows scaling beyond 2 GPUs.
+
+#### Hardware Tested
+8x NVIDIA H200 141GB HBM3e (GCP a3-mega node)
+
+#### Setup
+
+Use the `docker_bench.sh` script with `SP_SIZE` and `NUM_GPUS` env vars:
+
+```bash
+# Build and setup (first time only)
+./scripts/inference/docker_bench.sh build
+./scripts/inference/docker_bench.sh setup
+
+# Best config: SP=4 + TE + COMPILE_DIT (8 GPUs)
+NUM_GPUS=8 SP_SIZE=4 ATTENTION_BACKEND=TE COMPILE_DIT=true ./scripts/inference/docker_bench.sh start
+
+# Warmup (run test twice — COMPILE_DIT needs shape tracing)
+./scripts/inference/docker_bench.sh test   # first: compiles shapes (~3 min)
+./scripts/inference/docker_bench.sh test   # second: verifies steady-state
+
+# All subsequent test runs will be ~0.5s per chunk
+./scripts/inference/docker_bench.sh test
+```
+
+#### Available Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `NUM_GPUS` | 2 | Number of GPUs to use |
+| `SP_SIZE` | 1 | Sequence parallelism degree (must divide NUM_GPUS and 40) |
+| `ATTENTION_BACKEND` | FA2 | FA2 or TE |
+| `COMPILE_DIT` | false | torch.compile on DiT _forward_blocks |
+| `FP8_INFERENCE` | false | Replace DiT linear layers with te.Linear + fp8_autocast |
+| `DYNAMIC_CACHE` | true | Dynamic cache scheduling (cosine similarity step skipping) |
+| `LOAD_TRT_ENGINE` | — | Path to TRT engine (incompatible with SP) |
+
+### Performance Summary (8x H200 SP Benchmarks)
+
+**Table 14: Sequence parallelism benchmark results**
+
+| Config | Backend | GPUs | Layout | Steady-state | Diffusion | vs Baseline |
+|---|---|---|---|---|---|---|
+| SP=1 (baseline) | FA2 | 2 | 2 CFG | 0.89–1.19s | 0.65–0.86s | — |
+| SP=2 | FA2 | 4 | 2 CFG × 2 SP | 0.68–0.91s | 0.44–0.50s | ~25% faster |
+| SP=4 | FA2 | 8 | 2 CFG × 4 SP | 0.63–0.92s | 0.40–0.50s | ~32% faster |
+| SP=4 | TE | 8 | 2 CFG × 4 SP | 0.57–0.79s | 0.40–0.50s | ~43% faster |
+| SP=4 + FP8 | TE FP8 | 8 | 2 CFG × 4 SP | 0.74–1.00s | 0.53–0.67s | slower (FP8 overhead) |
+| **SP=4 + COMPILE_DIT** | **TE** | **8** | **2 CFG × 4 SP** | **0.47–0.68s** | **0.30–0.56s** | **~53% faster** |
+
+Notes:
+- **COMPILE_DIT works with SP** (unlike the 2-GPU case where it regressed). `mode="reduce-overhead"` with `dynamic=True` successfully compiles the DiT block loop when SP is active.
+- **FP8 hurts at SP=4** — per-GPU sequence length (~224 tokens) is too small for FP8 GEMMs to amortize scaling overhead.
+- **SP=8 (pure SP, no CFG split)**: ~1.25s — much slower because conditional/unconditional passes run sequentially without CFG parallelism.
+- **Warmup with COMPILE_DIT**: First ~8 chunks take 7-22s each as torch.compile traces new shapes. After warmup, steady-state is reached and persists across sessions.
+
+**Table 15: All H200 configurations compared**
+
+| Setup | Avg Inference | Diffusion | GPUs | Notes |
+|---|---|---|---|---|
+| 2x H200 (FA2 + CFG) | ~0.93s | 0.58 – 0.88s | 2 | |
+| 2x H200 (TE + CFG) | ~0.87s | 0.54 – 0.78s | 2 | |
+| 2x H200 (TRT FP8 + CFG) | ~0.58s | 0.27 – 0.38s | 2 | Requires TRT engine build |
+| 8x H200 (SP=4 + TE) | ~0.57s | 0.40 – 0.50s | 8 | No TRT needed |
+| **8x H200 (SP=4 + TE + COMPILE_DIT)** | **~0.50s** | **0.30 – 0.56s** | **8** | **Best overall — no TRT needed** |
+| Paper H100 (9.6x, no quant) | ~0.6s | — | 2 | |
+| Paper GB200 (16.6x, NVFP4) | ~0.34s | — | 2 | |
+
+**Best config: `SP=4 + TE + COMPILE_DIT` on 8x H200 achieves ~0.50s average** — faster than TRT FP8 on 2x H200 (0.58s) without requiring TensorRT engine compilation. Approaches the paper's GB200 NVFP4 result (0.34s) using only PyTorch-native optimizations.
+
+For implementation details, see [docs/sequence_parallelism_plan.md](docs/sequence_parallelism_plan.md).
 
 
 ## Training

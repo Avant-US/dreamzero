@@ -202,6 +202,7 @@ class WANPolicyHead(ActionHead):
         self.ip_rank = 0
         self.ip_size = 1
         self.ip_group = None
+        self.sp_ctx = None
         
         self._device = "cuda"
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
@@ -494,14 +495,17 @@ class WANPolicyHead(ActionHead):
         """
         num_heads = self.model.num_heads
         head_dim = self.model.dim // num_heads
+        # With SP, each rank only stores H/sp heads in the KV cache (post all-to-all layout)
+        sp_size = self.sp_ctx.sp_size if self.sp_ctx is not None else 1
+        effective_num_heads = num_heads // sp_size
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
             kv_cache1.append(
-                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, effective_num_heads, head_dim], dtype=dtype, device=device),
             )
             kv_cache_neg.append(
-                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, effective_num_heads, head_dim], dtype=dtype, device=device),
             )
 
         return kv_cache1, kv_cache_neg
@@ -886,21 +890,23 @@ class WANPolicyHead(ActionHead):
                 _model_offloaded = self.trt_engine is not None and not next(self.model.parameters()).is_cuda
                 if _model_offloaded:
                     self.model.to(device=noisy_input.device, dtype=torch.bfloat16)
-                obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
-                    noisy_input,
-                    timestep,
-                    action=action,
-                    timestep_action=timestep_action,
-                    state=state,
-                    embodiment_id=embodiment_id,
-                    context=prompt_emb,
-                    seq_len=seq_len,
-                    y=y,
-                    clip_feature=clip_feature,
-                    kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start_frame=kv_cache_metadata["start_frame"],
-                )
+                _fp8_ctx = self._get_fp8_context()
+                with _fp8_ctx:
+                    obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
+                        noisy_input,
+                        timestep,
+                        action=action,
+                        timestep_action=timestep_action,
+                        state=state,
+                        embodiment_id=embodiment_id,
+                        context=prompt_emb,
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=clip_feature,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start_frame=kv_cache_metadata["start_frame"],
+                    )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
                         kv_cache[block_index] = updated_kv_cache.clone()
@@ -1355,6 +1361,50 @@ class WANPolicyHead(ActionHead):
         flow_pred = f1 + (v_prime * h_curr) * damping_factor
         return flow_pred
 
+    def _get_fp8_context(self):
+        """Return fp8_autocast context if FP8 inference is enabled, else a no-op context."""
+        if self.fp8_inference:
+            import transformer_engine.pytorch as te
+            # Use newer API if available, fall back to deprecated fp8_autocast
+            if hasattr(te, 'autocast'):
+                return te.autocast(enabled=True)
+            return te.fp8_autocast(enabled=True)
+        import contextlib
+        return contextlib.nullcontext()
+
+    @staticmethod
+    def _replace_linear_with_te(module: nn.Module) -> None:
+        """Replace nn.Linear with te.Linear in-place for FP8 autocast support."""
+        import transformer_engine.pytorch as te
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear):
+                te_linear = te.Linear(
+                    child.in_features, child.out_features,
+                    bias=child.bias is not None,
+                    params_dtype=child.weight.dtype,
+                    device=child.weight.device,
+                )
+                te_linear.weight.data.copy_(child.weight.data)
+                if child.bias is not None:
+                    te_linear.bias.data.copy_(child.bias.data)
+                setattr(module, name, te_linear)
+            elif isinstance(child, nn.Sequential):
+                # Handle nn.Sequential (e.g. FFN layers)
+                for i, subchild in enumerate(child):
+                    if isinstance(subchild, nn.Linear):
+                        te_linear = te.Linear(
+                            subchild.in_features, subchild.out_features,
+                            bias=subchild.bias is not None,
+                            params_dtype=subchild.weight.dtype,
+                            device=subchild.weight.device,
+                        )
+                        te_linear.weight.data.copy_(subchild.weight.data)
+                        if subchild.bias is not None:
+                            te_linear.bias.data.copy_(subchild.bias.data)
+                        child[i] = te_linear
+            else:
+                WANPolicyHead._replace_linear_with_te(child)
+
     def post_initialize(self):
         # Move models to the cuda device and set the dtype to bfloat16.
         print("Moving models to the cuda device and setting the dtype to bfloat16.")
@@ -1366,11 +1416,20 @@ class WANPolicyHead(ActionHead):
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
-        # Torch compile the modules. Skip _forward_blocks: dynamic KV cache shapes cause
-        # constant recompilation, and RoPE complex ops lack inductor codegen support.
+        self.fp8_inference = os.getenv("FP8_INFERENCE", "False").lower() == "true"
+        if self.fp8_inference:
+            print("Enabling FP8 inference: replacing nn.Linear with te.Linear in DiT blocks (self_attn + ffn only).")
+            self.model.fp8_inference = True
+            for block in self.model.blocks:
+                # Only replace self-attention and FFN linear layers, NOT cross-attention
+                # (cross-attn has fixed-size contexts like 257 CLIP tokens that don't meet FP8 alignment)
+                self._replace_linear_with_te(block.self_attn)
+                self._replace_linear_with_te(block.ffn)
+
         DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() == "true"
+        COMPILE_DIT = os.getenv("COMPILE_DIT", "False").lower() == "true"
         if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
-            print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
+            print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules.")
 
             self.text_encoder.forward = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
@@ -1383,6 +1442,12 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
+
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE and COMPILE_DIT:
+            print("Torch compiling DiT _forward_blocks (dynamic=True for KV cache).")
+            self.model._forward_blocks = torch.compile(
+                mode="reduce-overhead", dynamic=True,
+            )(self.model._forward_blocks)
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
@@ -1404,6 +1469,18 @@ class WANPolicyHead(ActionHead):
 
         assert self.ip_size == 1 or self.ip_size == 2, "ip_size must be 1 or 2"
         assert self.ip_rank >= 0 and self.ip_rank < self.ip_size, "ip_rank must be in [0, ip_size)"
+
+        if "sp" in device_mesh.mesh_dim_names:
+            from groot.vla.model.dreamzero.modules.sequence_parallel import SequenceParallelContext
+            sp_mesh = device_mesh["sp"]
+            self.sp_ctx = SequenceParallelContext(
+                sp_group=sp_mesh.get_group(),
+                sp_rank=sp_mesh.get_local_rank(),
+                sp_size=sp_mesh.size(),
+            )
+        else:
+            self.sp_ctx = None
+        self.model.set_sp_context(self.sp_ctx)
 
     @property
     def device(self):
