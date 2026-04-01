@@ -315,11 +315,13 @@ class ARDroidRoboarenaPolicy:
             logger.info(f"RTC: passing {rtc_normalized.shape[0]} previous actions, "
                         f"inference_delay={rtc_inference_delay}")
 
-        # RTC: per-request guidance weight and schedule (fall back to env vars)
+        # RTC: per-request guidance params (fall back to env vars in model)
         if "rtc/guidance_weight" in obs:
             converted_obs["rtc_guidance_weight"] = float(obs["rtc/guidance_weight"])
         if "rtc/schedule" in obs:
             converted_obs["rtc_schedule"] = str(obs["rtc/schedule"])
+        if "rtc/prior_variance" in obs:
+            converted_obs["rtc_prior_variance"] = float(obs["rtc/prior_variance"])
 
         # Signal workers to continue (0 = continue)
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')

@@ -1210,9 +1210,12 @@ class WANPolicyHead(ActionHead):
         # RTC: prepare guidance target from previously executed actions
         rtc_previous_actions = data.get("rtc_previous_actions", None)
         rtc_guidance_weight = float(
-            data.get("rtc_guidance_weight", os.environ.get("RTC_GUIDANCE_WEIGHT", "10.0"))
+            data.get("rtc_guidance_weight", os.environ.get("RTC_GUIDANCE_WEIGHT", "1.0"))
         )
         rtc_schedule = data.get("rtc_schedule", os.environ.get("RTC_SCHEDULE", "LINEAR"))
+        rtc_prior_variance = float(
+            data.get("rtc_prior_variance", os.environ.get("RTC_PRIOR_VARIANCE", "0.2"))
+        )
         rtc_guidance_target = None
         rtc_guidance_mask = None
         if rtc_previous_actions is not None:
@@ -1234,6 +1237,7 @@ class WANPolicyHead(ActionHead):
             rtc_guidance_mask = weights.to(device=noise_action.device).view(1, -1, 1)
             if self.ip_rank == 0:
                 print(f"RTC: guidance_weight={rtc_guidance_weight}, schedule={rtc_schedule}, "
+                      f"prior_variance={rtc_prior_variance}, beta={self.num_inference_steps}, "
                       f"n_overlap={n_overlap}")
 
         # Step 3.1: Spatial denoising loop
@@ -1346,13 +1350,23 @@ class WANPolicyHead(ActionHead):
                 return_dict=False,
             )[0]
 
-            # RTC guidance: steer overlapping timesteps toward previously executed actions
-            # Uses CFG-style formula: x + w * mask * (target - x)
+            # RTC guidance: ΠGDM-lite (Pseudoinverse-guided Diffusion, Jacobian ≈ I).
+            # Uses reduced prior variance σ_{d|o} to derive a principled weight
+            # that accounts for the narrow conditioned action distribution.
+            # Ref: alexander-soare.github.io/robotics/2025/08/05/smooth-as-butter-robot-policies
             if rtc_guidance_target is not None:
                 n_ov = rtc_guidance_target.shape[1]
-                # Scale guidance by noise level (stronger at lower noise = cleaner samples)
-                noise_scale = 1.0 - (action_timestep.float() / 1000.0)
-                w = rtc_guidance_weight * noise_scale
+                sigma_d = rtc_prior_variance  # σ_{d|o}, e.g. 0.2
+                tau = action_timestep.float() / 1000.0  # normalized timestep
+                one_minus_tau = 1.0 - tau
+                # Posterior variance: r_τ² = ((1-τ)² · σ²) / ((1-τ)² + σ² · τ²)
+                r_tau_sq = (one_minus_tau ** 2 * sigma_d ** 2) / (
+                    one_minus_tau ** 2 + sigma_d ** 2 * tau ** 2 + 1e-8
+                )
+                # ΠGDM weight: min(β, (1-τ) / (τ · r_τ²))
+                raw_w = one_minus_tau / (tau * r_tau_sq + 1e-8)
+                beta = float(self.num_inference_steps)
+                w = min(raw_w.item(), beta) * rtc_guidance_weight
                 diff = rtc_guidance_target - noisy_input_action[:, :n_ov]
                 noisy_input_action[:, :n_ov] = (
                     noisy_input_action[:, :n_ov] + w * rtc_guidance_mask * diff
