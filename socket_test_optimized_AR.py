@@ -85,6 +85,38 @@ class ARDroidRoboarenaPolicy:
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
     
+    def _normalize_actions(self, raw_actions: np.ndarray) -> np.ndarray:
+        """Normalize raw actions (N, 8) using the eval transform's action normalizers.
+
+        Extracts the StateActionTransform and PerHorizonActionTransform
+        normalizers from the pipeline and applies them directly, avoiding
+        video transforms that require image keys.
+
+        Returns:
+            Normalized actions as float32 ndarray with the same shape.
+        """
+        from groot.vla.data.transform.state_action import (
+            PerHorizonActionTransform,
+            StateActionTransform,
+        )
+
+        # Build a dict of action keys → data
+        action_dict = {
+            "action.joint_position": torch.from_numpy(raw_actions[:, :7].copy()).to(torch.bfloat16),
+            "action.gripper_position": torch.from_numpy(raw_actions[:, 7:].copy()).to(torch.bfloat16),
+        }
+
+        # Walk the composed transform to find action normalizers
+        for transform in self._policy.eval_transform.transforms:
+            if isinstance(transform, (StateActionTransform, PerHorizonActionTransform)):
+                for key in list(action_dict.keys()):
+                    if key in transform._normalizers:
+                        action_dict[key] = transform._normalizers[key].forward(action_dict[key])
+
+        joint = action_dict["action.joint_position"].float().numpy()
+        gripper = action_dict["action.gripper_position"].float().numpy()
+        return np.concatenate([joint, gripper], axis=-1).astype(np.float32)
+
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to AR_droid format.
         
@@ -245,10 +277,10 @@ class ARDroidRoboarenaPolicy:
     
     def infer(self, obs: dict) -> np.ndarray:
         """Infer actions from observations.
-        
+
         Args:
             obs: Observation dict in roboarena format
-            
+
         Returns:
             action: (N, 8) action array
         """
@@ -262,47 +294,61 @@ class ARDroidRoboarenaPolicy:
             else:
                 logger.info(f"New session started: '{session_id}'")
             self._current_session_id = session_id
-        
+
         self._msg_index += 1
         self._call_count += 1
-        
+
+        # Extract RTC fields before converting observation format
+        rtc_previous_actions = obs.get("rtc/previous_actions", None)
+        rtc_inference_delay = obs.get("rtc/inference_delay", 0)
+
         # Convert observation format
         converted_obs = self._convert_observation(obs)
-        
+
+        # RTC: normalize previous actions and pass through to the model
+        if rtc_previous_actions is not None:
+            rtc_previous_actions = np.asarray(rtc_previous_actions, dtype=np.float32)
+            rtc_normalized = self._normalize_actions(rtc_previous_actions)
+            # Convert to tensor so tree.map_structure in prepare_input handles it correctly
+            converted_obs["rtc_previous_actions"] = torch.from_numpy(rtc_normalized)
+            converted_obs["rtc_inference_delay"] = int(rtc_inference_delay)
+            logger.info(f"RTC: passing {rtc_normalized.shape[0]} previous actions, "
+                        f"inference_delay={rtc_inference_delay}")
+
         # Signal workers to continue (0 = continue)
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
+
         # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
-        
+
         # Create batch for policy
         batch = Batch(obs=converted_obs)
-        
+
         # Distributed forward pass
         dist.barrier()
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
-        
+
         # Store video predictions for potential saving
         self.video_across_time.append(video_pred)
-        
+
         # Extract and convert action
         action_chunk_dict = result_batch.act
-        
+
         # Convert Batch to dict
         action_dict = {}
         for k in dir(action_chunk_dict):
             if k.startswith("action."):
                 action_dict[k] = getattr(action_chunk_dict, k)
-        
+
         action = self._convert_action(action_dict)
-        
+
         # Update first call flag
         if self._is_first_call:
             self._is_first_call = False
-        
+
         return action
     
     def _reset_state(self, save_video: bool = True) -> None:

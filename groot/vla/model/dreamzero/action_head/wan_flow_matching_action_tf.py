@@ -1207,6 +1207,33 @@ class WANPolicyHead(ActionHead):
         noisy_input = noise_obs
         noisy_input_action = noise_action
 
+        # RTC: prepare guidance target from previously executed actions
+        rtc_previous_actions = data.get("rtc_previous_actions", None)
+        rtc_guidance_weight = float(os.environ.get("RTC_GUIDANCE_WEIGHT", "10.0"))
+        rtc_schedule = os.environ.get("RTC_SCHEDULE", "LINEAR")
+        rtc_guidance_target = None
+        rtc_guidance_mask = None
+        if rtc_previous_actions is not None:
+            rtc_guidance_target = torch.as_tensor(
+                rtc_previous_actions, device=noise_action.device, dtype=noise_action.dtype
+            )
+            if rtc_guidance_target.ndim == 2:
+                rtc_guidance_target = rtc_guidance_target.unsqueeze(0)  # (1, N_overlap, action_dim)
+            n_overlap = rtc_guidance_target.shape[1]
+            # Build decay mask: (1, N_overlap, 1)
+            if rtc_schedule == "EXP":
+                weights = torch.exp(-torch.arange(n_overlap, dtype=torch.float32) * 3.0 / n_overlap)
+            elif rtc_schedule == "ONES":
+                weights = torch.ones(n_overlap, dtype=torch.float32)
+            elif rtc_schedule == "ZEROS":
+                weights = torch.zeros(n_overlap, dtype=torch.float32)
+            else:  # LINEAR (default)
+                weights = torch.linspace(1.0, 0.0, n_overlap, dtype=torch.float32)
+            rtc_guidance_mask = weights.to(device=noise_action.device).view(1, -1, 1)
+            if self.ip_rank == 0:
+                print(f"RTC: guidance_weight={rtc_guidance_weight}, schedule={rtc_schedule}, "
+                      f"n_overlap={n_overlap}")
+
         # Step 3.1: Spatial denoising loop
 
         sample_scheduler = FlowUniPCMultistepScheduler(
@@ -1316,6 +1343,18 @@ class WANPolicyHead(ActionHead):
                 step_index=index,
                 return_dict=False,
             )[0]
+
+            # RTC guidance: steer overlapping timesteps toward previously executed actions
+            # Uses CFG-style formula: x + w * mask * (target - x)
+            if rtc_guidance_target is not None:
+                n_ov = rtc_guidance_target.shape[1]
+                # Scale guidance by noise level (stronger at lower noise = cleaner samples)
+                noise_scale = 1.0 - (action_timestep.float() / 1000.0)
+                w = rtc_guidance_weight * noise_scale
+                diff = rtc_guidance_target - noisy_input_action[:, :n_ov]
+                noisy_input_action[:, :n_ov] = (
+                    noisy_input_action[:, :n_ov] + w * rtc_guidance_mask * diff
+                )
 
         latents = noisy_input
         latents_action = noisy_input_action
