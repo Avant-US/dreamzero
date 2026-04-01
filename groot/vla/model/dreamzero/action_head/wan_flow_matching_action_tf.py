@@ -1209,8 +1209,10 @@ class WANPolicyHead(ActionHead):
 
         # RTC: prepare guidance target from previously executed actions
         rtc_previous_actions = data.get("rtc_previous_actions", None)
-        rtc_guidance_weight = float(os.environ.get("RTC_GUIDANCE_WEIGHT", "10.0"))
-        rtc_schedule = os.environ.get("RTC_SCHEDULE", "LINEAR")
+        rtc_guidance_weight = float(
+            data.get("rtc_guidance_weight", os.environ.get("RTC_GUIDANCE_WEIGHT", "10.0"))
+        )
+        rtc_schedule = data.get("rtc_schedule", os.environ.get("RTC_SCHEDULE", "LINEAR"))
         rtc_guidance_target = None
         rtc_guidance_mask = None
         if rtc_previous_actions is not None:
