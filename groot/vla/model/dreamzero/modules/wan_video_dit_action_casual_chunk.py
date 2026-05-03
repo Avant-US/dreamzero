@@ -32,6 +32,15 @@ import torch.distributed as dist
 import os
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+
+# Import compile-safe SP custom ops (registered with torch.library.custom_op
+# so torch.compile can trace through them with concrete shapes).
+from groot.vla.model.dreamzero.modules.sp_compile_ops import (
+    sp_all_to_all,
+    sp_split_seq,
+    sp_gather_seq,
+    register_group as _sp_register_group,
+)
 _USE_POLAR_ROPE = (
     os.getenv("USE_POLAR_ROPE", "false").lower() == "true"
     and not ENABLE_TENSORRT
@@ -153,12 +162,25 @@ def causal_rope_action_apply_no_polar(
         freqs_cos = torch.cat([freqs_cos[0], freqs_cos_1d], dim=0).unsqueeze(0)
         freqs_sin = torch.cat([freqs_sin[0], freqs_sin_1d], dim=0).unsqueeze(0)
     
+    # Pad x to match freqs length if shorter (avoids symbolic slice on freqs
+    # which creates Mul shapes under torch.compile reduce-overhead).
+    # The padded positions produce garbage but get discarded when we trim back.
+    freqs_len = freqs_cos.shape[1]
+    _pad = freqs_len - seq_len
+    if _pad > 0:
+        x_real = torch.nn.functional.pad(x_real, (0, 0, 0, 0, 0, _pad))
+        x_imag = torch.nn.functional.pad(x_imag, (0, 0, 0, 0, 0, _pad))
+
     x_real_rotated = x_real * freqs_cos - x_imag * freqs_sin
     x_imag_rotated = x_real * freqs_sin + x_imag * freqs_cos
-    
+
     x_rotated = torch.stack((x_real_rotated, x_imag_rotated), dim=-1)
-    
-    return x_rotated.flatten(3)
+    result = x_rotated.flatten(3)
+
+    # Trim back to original seq_len
+    if _pad > 0:
+        result = result[:, :seq_len]
+    return result
 
 def causal_rope_action_apply_polar(
     x: torch.Tensor,
@@ -188,8 +210,8 @@ def causal_rope_action_apply_polar(
         freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
         freqs = torch.cat([freqs, freqs_1d], dim=0)
 
-    # apply rotary embedding
-    freqs = freqs.unsqueeze(0)
+    # apply rotary embedding — slice freqs to match x's seq_len
+    freqs = freqs[:seq_len].unsqueeze(0)
     x = torch.view_as_real(x * freqs).flatten(3)
 
     return x
@@ -814,22 +836,28 @@ class CausalWanSelfAttention(nn.Module):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         # query, key, value function
-        def qkv_fn(x):
+        if getattr(self, '_fused_qkv', False):
+            # Single matmul for QKV, split along last dim, norm, then view to heads
+            qkv = self.qkv(x)  # [B, S, 3*dim]
+            q, k, v = qkv.split(self.dim, dim=-1)  # each [B, S, dim]
+            q = self.norm_q(q).view(b, s, n, d)
+            k = self.norm_k(k).view(b, s, n, d)
+            v = v.view(b, s, n, d)
+        else:
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x)
 
         # Ulysses SP: swap from [B, S_local, H, D] to [B, S_full, H/sp, D]
+        # Uses custom_op so torch.compile traces with concrete output shapes.
         sp_active = self.sp_ctx is not None and self.sp_ctx.sp_size > 1
-        sp_padded_len = 0  # track padded full length for re-padding before reverse all-to-all
+        sp_padded_len = 0
         if sp_active:
-            q = all_to_all(q, scatter_dim=2, gather_dim=1, sp_ctx=self.sp_ctx)
-            k = all_to_all(k, scatter_dim=2, gather_dim=1, sp_ctx=self.sp_ctx)
-            v = all_to_all(v, scatter_dim=2, gather_dim=1, sp_ctx=self.sp_ctx)
-            # Trim padding tokens added by split_sequence (if seq was not divisible by sp_size)
+            _sp_gname = "sp_group"
+            _sp_sz = self.sp_ctx.sp_size
+            q = sp_all_to_all(q, scatter_dim=2, gather_dim=1, sp_size=_sp_sz, sp_group_name=_sp_gname)
+            k = sp_all_to_all(k, scatter_dim=2, gather_dim=1, sp_size=_sp_sz, sp_group_name=_sp_gname)
+            v = sp_all_to_all(v, scatter_dim=2, gather_dim=1, sp_size=_sp_sz, sp_group_name=_sp_gname)
             sp_padded_len = q.shape[1]
             orig_len = self.sp_ctx.original_seq_len
             if orig_len is not None and sp_padded_len > orig_len:
@@ -1086,19 +1114,33 @@ class CausalWanSelfAttention(nn.Module):
             assert roped_key.shape[1] == num_new_tokens
             assert v.shape[1] == num_new_tokens
 
-            # If we are using local attention and the current KV cache size is larger
-            # than the local attention size, we need to truncate the KV cache
-
+            # Static KV cache: pre-allocated buffer with fixed max size.
+            # kv_cache shape: [2, B, max_attn, H, D] (static) or [2, B, cur_len, H, D] (dynamic)
+            # _kv_fill tracks how many valid tokens are in the cache.
             updated_kv_cache = kv_cache
-            updated_k = updated_kv_cache[0]
-            updated_v = updated_kv_cache[1]
-            # Assign new keys/values directly up to current_end
-            new_k = torch.cat([updated_k, roped_key], dim=1)
-            new_v = torch.cat([updated_v, v], dim=1)
+            cur_k = updated_kv_cache[0]  # [B, cur_or_max, H, D]
+            cur_v = updated_kv_cache[1]
 
-            # We may need to truncate the KV cache if it's size is larger than the max attention size.
-            new_k = new_k[:, -self.max_attention_size:]
-            new_v = new_v[:, -self.max_attention_size:]
+            # Check if this is a static (pre-allocated) cache
+            _is_static = cur_k.shape[1] == self.max_attention_size
+
+            if _is_static:
+                # Circular KV buffer with tensor indexing — eliminates ALL
+                # Python-int state that triggers dynamo guards / recompiles.
+                _max = self.max_attention_size
+                _pos = self._fill_level_t
+                _dst = (self._idx_base[:num_new_tokens] + _pos) % _max
+                cur_k[:, _dst] = roped_key
+                cur_v[:, _dst] = v
+                self._fill_level_t.add_(num_new_tokens)
+                new_k = cur_k
+                new_v = cur_v
+            else:
+                # Dynamic path (original): cat + truncate
+                new_k = torch.cat([cur_k, roped_key], dim=1)
+                new_v = torch.cat([cur_v, v], dim=1)
+                new_k = new_k[:, -self.max_attention_size:]
+                new_v = new_v[:, -self.max_attention_size:]
 
             if action_register_length is not None:
                 x = self.attn(
@@ -1112,16 +1154,19 @@ class CausalWanSelfAttention(nn.Module):
                     new_k,
                     new_v,
                 )
-            updated_kv_cache = torch.stack([new_k, new_v], dim=0)
+
+            if _is_static:
+                updated_kv_cache = kv_cache  # same buffer, modified in-place
+            else:
+                updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
 
         # Ulysses SP: swap back from [B, S_full, H/sp, D] to [B, S_local, H, D]
         if sp_active:
-            # Re-pad to the padded length so scatter_dim=1 is divisible by sp_size
             if sp_padded_len > x.shape[1]:
                 pad = sp_padded_len - x.shape[1]
                 x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
-            x = all_to_all(x, scatter_dim=1, gather_dim=2, sp_ctx=self.sp_ctx)
+            x = sp_all_to_all(x, scatter_dim=1, gather_dim=2, sp_size=self.sp_ctx.sp_size, sp_group_name="sp_group")
 
         # output
         x = x.flatten(2)
@@ -1383,7 +1428,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.out_dim = out_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.local_attn_size = max_chunk_size * num_frame_per_block + 1 if max_chunk_size != -1 else -1
+        _default_attn_size = max_chunk_size * num_frame_per_block + 1 if max_chunk_size != -1 else -1
+        _attn_override = int(os.environ.get("ATTN_WINDOW_FRAMES", "0"))
+        self.local_attn_size = _attn_override if _attn_override > 0 else _default_attn_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
@@ -1470,6 +1517,75 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if sp_ctx is not None:
             for block in self.blocks:
                 block.self_attn.sp_ctx = sp_ctx
+            # Register the SP group + pynccl comm for compile-safe custom ops
+            _sp_register_group("sp_group", sp_ctx.sp_group)
+            from groot.vla.model.dreamzero.modules.sp_compile_ops import register_pynccl as _sp_register_pynccl
+            if getattr(sp_ctx, "pynccl_comm", None) is not None:
+                _sp_register_pynccl("sp_group", sp_ctx.pynccl_comm)
+
+    def fuse_qkv_linears(self):
+        """Fuse separate Q, K, V linear projections into a single QKV matmul.
+
+        Replaces 3 separate Linear(dim, dim) with 1 Linear(dim, 3*dim) in each
+        self-attention layer. The larger matmul has higher arithmetic intensity
+        and better GPU tile utilization, especially at small token counts.
+
+        Also fuses cross-attention K+V and K_img+V_img projections.
+        """
+        import torch.distributed as _dist
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        _fused = 0
+
+        for block in self.blocks:
+            attn = block.self_attn
+            dim = attn.dim
+
+            # --- Fuse self-attention Q, K, V → QKV ---
+            qkv = nn.Linear(dim, dim * 3, bias=attn.q.bias is not None,
+                            device=attn.q.weight.device, dtype=attn.q.weight.dtype)
+            with torch.no_grad():
+                qkv.weight.data[:dim] = attn.q.weight.data
+                qkv.weight.data[dim:2*dim] = attn.k.weight.data
+                qkv.weight.data[2*dim:] = attn.v.weight.data
+                if qkv.bias is not None:
+                    qkv.bias.data[:dim] = attn.q.bias.data
+                    qkv.bias.data[dim:2*dim] = attn.k.bias.data
+                    qkv.bias.data[2*dim:] = attn.v.bias.data
+            attn.qkv = qkv
+            del attn.q, attn.k, attn.v
+            attn._fused_qkv = True
+            _fused += 1
+
+            # --- Fuse cross-attention K+V → KV, K_img+V_img → KV_img ---
+            xattn = block.cross_attn
+            if hasattr(xattn, 'k') and hasattr(xattn, 'v'):
+                kv = nn.Linear(dim, dim * 2, bias=xattn.k.bias is not None,
+                               device=xattn.k.weight.device, dtype=xattn.k.weight.dtype)
+                with torch.no_grad():
+                    kv.weight.data[:dim] = xattn.k.weight.data
+                    kv.weight.data[dim:] = xattn.v.weight.data
+                    if kv.bias is not None:
+                        kv.bias.data[:dim] = xattn.k.bias.data
+                        kv.bias.data[dim:] = xattn.v.bias.data
+                xattn.kv = kv
+                del xattn.k, xattn.v
+                xattn._fused_kv = True
+
+            if hasattr(xattn, 'k_img') and hasattr(xattn, 'v_img'):
+                kv_img = nn.Linear(dim, dim * 2, bias=xattn.k_img.bias is not None,
+                                   device=xattn.k_img.weight.device, dtype=xattn.k_img.weight.dtype)
+                with torch.no_grad():
+                    kv_img.weight.data[:dim] = xattn.k_img.weight.data
+                    kv_img.weight.data[dim:] = xattn.v_img.weight.data
+                    if kv_img.bias is not None:
+                        kv_img.bias.data[:dim] = xattn.k_img.bias.data
+                        kv_img.bias.data[dim:] = xattn.v_img.bias.data
+                xattn.kv_img = kv_img
+                del xattn.k_img, xattn.v_img
+                xattn._fused_kv_img = True
+
+        if _rank == 0:
+            print(f"[FuseQKV] Fused QKV+KV+KV_img in {_fused} blocks")
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -1840,16 +1956,32 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # Sequence parallelism: split x and e0 along sequence dim before blocks
         sp_active = self.sp_ctx is not None and self.sp_ctx.sp_size > 1
         if sp_active:
-            original_total_len = x.shape[1]
-            self.sp_ctx.original_seq_len = original_total_len
-            # FP8 requires each chunk's sequence length to be divisible by 8
-            sp_alignment = 8 if getattr(self, 'fp8_inference', False) else 1
-            x = split_sequence(x, dim=1, sp_ctx=self.sp_ctx, alignment=sp_alignment)
-            e0 = split_sequence(e0, dim=1, sp_ctx=self.sp_ctx, alignment=sp_alignment)
-            e = split_sequence(e, dim=1, sp_ctx=self.sp_ctx, alignment=sp_alignment)
+            _sp_sz = self.sp_ctx.sp_size
+            _sp_rk = self.sp_ctx.sp_rank
+            _sp_orig_len = x.shape[1]
+
+            # Pad to nearest multiple of (sp_size * 8) so all ranks get equal
+            # chunks AND each chunk is a multiple of 8 (required by TE FP8
+            # GEMM alignment: batch*seq must be divisible by 8).
+            _sp_align = _sp_sz * 8
+            _sp_pad = (-_sp_orig_len) % _sp_align
+            if _sp_pad > 0:
+                x = torch.nn.functional.pad(x, (0, 0, 0, _sp_pad))       # [B, S, dim]
+                e0 = torch.nn.functional.pad(e0, (0, 0, 0, 0, 0, _sp_pad))  # [B, S, 6, dim]
+                e = torch.nn.functional.pad(e, (0, 0, 0, _sp_pad))        # [B, S, dim]
+
+            self.sp_ctx.original_seq_len = _sp_orig_len
+            x = sp_split_seq(x, dim=1, sp_rank=_sp_rk, sp_size=_sp_sz)
+            e0 = sp_split_seq(e0, dim=1, sp_rank=_sp_rk, sp_size=_sp_sz)
+            e = sp_split_seq(e, dim=1, sp_rank=_sp_rk, sp_size=_sp_sz)
+        else:
+            _sp_orig_len = 0
 
         updated_kv_caches: list[torch.Tensor] = []
+        print(f'[FWD] sp_active={sp_active} x.shape={x.shape} entering blocks', flush=True)
         for block_index, block in enumerate(self.blocks):
+            if block_index == 0 or block_index == 1:
+                print(f'[FWD] block {block_index}/{len(self.blocks)} x.shape={x.shape}', flush=True)
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
@@ -1864,9 +1996,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             updated_kv_caches.append(updated_kv_cache)
 
         # Sequence parallelism: gather x and e back to full sequence before output extraction
+        print(f'[FWD] all blocks done, sp_gather', flush=True)
         if sp_active:
-            x = gather_sequence(x, dim=1, sp_ctx=self.sp_ctx, original_length=original_total_len)
-            e = gather_sequence(e, dim=1, sp_ctx=self.sp_ctx, original_length=original_total_len)
+            _gname = "sp_group"
+            x = sp_gather_seq(x, dim=1, sp_size=self.sp_ctx.sp_size, sp_group_name=_gname, original_length=_sp_orig_len)
+            e = sp_gather_seq(e, dim=1, sp_size=self.sp_ctx.sp_size, sp_group_name=_gname, original_length=_sp_orig_len)
 
         if action is not None:
             action_noise_pred = x[:, seq_len: seq_len + action_length]

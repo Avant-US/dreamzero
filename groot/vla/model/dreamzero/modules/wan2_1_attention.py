@@ -29,7 +29,7 @@ try:
     import transformer_engine
     from groot.vla.model.dreamzero.modules.cudnn_attention import DotProductAttention
     TRANSFORMER_ENGINE_AVAILABLE = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError, FileNotFoundError, RuntimeError):
     TRANSFORMER_ENGINE_AVAILABLE = False
 
 import warnings
@@ -238,7 +238,8 @@ class AttentionModule(torch.nn.Module):
         self.backend = backend
 
         if backend == "torch":
-            def _torch_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            def _torch_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
                 out_dtype = q.dtype
                 q = q.transpose(1, 2).to(dtype)
                 k = k.transpose(1, 2).to(dtype)
@@ -246,8 +247,8 @@ class AttentionModule(torch.nn.Module):
 
                 out = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
-                    attn_mask=None,
-                    is_causal=causal,
+                    attn_mask=attn_mask,
+                    is_causal=(causal and attn_mask is None),
                     dropout_p=dropout_p,
                     scale=softmax_scale,
                 )
@@ -257,7 +258,8 @@ class AttentionModule(torch.nn.Module):
             self.attn_func = _torch_impl
 
         elif  backend == "torch_onnx":
-            def _torch_onnx_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            def _torch_onnx_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                                  attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
                 out_dtype = q.dtype
                 # use torch.nn.functional.scaled_dot_product_attention for tensorrt export
 
@@ -295,8 +297,20 @@ class AttentionModule(torch.nn.Module):
                 attention_dropout=dropout_p,
             )
 
-            def _te_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            def _te_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
                 out_dtype = q.dtype
+                if attn_mask is not None:
+                    # TE's cuDNN attention path doesn't accept a free-form key-side mask.
+                    # Fall back to torch SDPA which does. Used in STATIC_KV_CACHE mode.
+                    q_t = q.transpose(1, 2).to(dtype)
+                    k_t = k.transpose(1, 2).to(dtype)
+                    v_t = v.transpose(1, 2).to(dtype)
+                    out = torch.nn.functional.scaled_dot_product_attention(
+                        q_t, k_t, v_t, attn_mask=attn_mask,
+                        is_causal=False, dropout_p=dropout_p, scale=softmax_scale,
+                    )
+                    return out.transpose(1, 2).contiguous().to(out_dtype)
                 return self.attn_backend(
                     query_layer=q.to(dtype),
                     key_layer=k.to(dtype),
@@ -333,6 +347,7 @@ class AttentionModule(torch.nn.Module):
         v: torch.Tensor,
         q_lens: Optional[torch.Tensor] = None,
         k_lens: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         if (
             self.backend == "torch" or
@@ -343,6 +358,8 @@ class AttentionModule(torch.nn.Module):
                 warnings.warn(
                     'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
                 )
-            return self.attn_func(q, k, v)  # type: ignore[call-arg]
+            return self.attn_func(q, k, v, attn_mask=attn_mask)  # type: ignore[call-arg]
         else:
+            # Flash-attn path: no attn_mask support; caller must ensure static
+            # shapes via cu_seqlens if desired (not implemented here).
             return self.attn_func(q, k, v, q_lens, k_lens)  # type: ignore[call-arg]

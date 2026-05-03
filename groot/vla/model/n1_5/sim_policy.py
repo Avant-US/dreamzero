@@ -677,7 +677,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         return batch, video_pred
 
     def lazy_joint_forward_causal(self, batch, video=None, latent_video=None, state=None, video_only=False, **kwargs):
-        
+
         transform_start_time = time.perf_counter()
 
         # Save original observation before any modification (for relative action conversion)

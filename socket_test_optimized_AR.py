@@ -117,6 +117,8 @@ class ARDroidRoboarenaPolicy:
         for roboarena_key, droid_key in image_key_mapping.items():
             if roboarena_key in obs:
                 data = obs[roboarena_key]
+                if not isinstance(data, np.ndarray):
+                    data = np.asarray(data)
                 if isinstance(data, np.ndarray):
                     if data.ndim == 4:
                         # Multiple frames (T, H, W, 3)
@@ -152,15 +154,19 @@ class ARDroidRoboarenaPolicy:
         # Convert state observations
         if "observation/joint_position" in obs:
             joint_pos = obs["observation/joint_position"]
+            if not isinstance(joint_pos, np.ndarray):
+                joint_pos = np.asarray(joint_pos, dtype=np.float32)
             # Reshape to (1, 7) if needed
             if joint_pos.ndim == 1:
                 joint_pos = joint_pos.reshape(1, -1)
             converted["state.joint_position"] = joint_pos.astype(np.float64)
         else:
             converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
-        
+
         if "observation/gripper_position" in obs:
             gripper_pos = obs["observation/gripper_position"]
+            if not isinstance(gripper_pos, np.ndarray):
+                gripper_pos = np.asarray(gripper_pos, dtype=np.float32)
             # Reshape to (1, 1) if needed
             if gripper_pos.ndim == 1:
                 gripper_pos = gripper_pos.reshape(1, -1)
@@ -257,34 +263,58 @@ class ARDroidRoboarenaPolicy:
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
                 logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
-                # Reset state for new session
-                self._reset_state()
+                # Skip video save on session change — vae.decode on accumulated
+                # frames blocks for minutes inside the websocket handler.
+                self._reset_state(save_video=False)
             else:
                 logger.info(f"New session started: '{session_id}'")
             self._current_session_id = session_id
         
         self._msg_index += 1
         self._call_count += 1
-        
+
         # Convert observation format
         converted_obs = self._convert_observation(obs)
         
-        # Signal workers to continue (0 = continue)
+        # Wait for deferred thread from previous chunk to complete
+        _def_thread = getattr(self, '_deferred_thread', None)
+        if _def_thread is not None:
+            _def_thread.join()
+            self._deferred_thread = None
+
+        # Signal workers to continue with new chunk (0 = continue)
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
+
         # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
-        
+
         # Create batch for policy
         batch = Batch(obs=converted_obs)
-        
-        # Distributed forward pass
-        dist.barrier()
+
+        # Distributed forward pass (broadcast above already synchronizes ranks)
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-        dist.barrier()
-        
+
+        # Check if action_head has deferred work — set up signal-based execution
+        _ah = self._policy.trained_model.action_head
+        _pending = getattr(_ah, '_pending_deferred', None)
+        if _pending is not None:
+            _ah._pending_deferred = None
+            _signal_group = self._signal_group
+
+            def _run_deferred_signal():
+                """Signal workers to run deferred, execute on all ranks."""
+                sig = torch.tensor([3], dtype=torch.int32, device='cpu')
+                dist.broadcast(sig, src=0, group=_signal_group)
+                dist.barrier()
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad(), torch.inference_mode(False):
+                    _pending()
+                dist.barrier()
+
+            self._run_deferred_signal = _run_deferred_signal
+
         # Store video predictions for potential saving
         self.video_across_time.append(video_pred)
         
@@ -492,20 +522,28 @@ class WebsocketPolicyServer:
                     logger.info(f"Rank {dist.get_rank()} received shutdown signal")
                     break
 
-                # --- ADD THIS ELIF BLOCK ---
                 elif signal == 2:
-                    logger.info(f"Rank {dist.get_rank()} received idle signal. Waiting for next client.")
-                    # Loop back to the top and wait for the next signal
+                    # Idle signal — wait for next client
+                    continue
+
+                elif signal == 3:
+                    # Deferred VAE+KV init — participate in NCCL with rank 0
+                    _ah = self._policy.trained_model.action_head
+                    _pending = getattr(_ah, '_pending_deferred', None)
+                    dist.barrier()
+                    torch.compiler.cudagraph_mark_step_begin()
+                    if _pending is not None:
+                        with torch.no_grad(), torch.inference_mode(False):
+                            _pending()
+                        _ah._pending_deferred = None
+                    dist.barrier()
                     continue
 
                 # Receive the batch data via broadcast/gather mechanism
-                # This is a simplified version - the actual obs structure needs to be broadcasted
                 batch = self._receive_batch_from_rank0()
                 # Participate in distributed forward pass
-                dist.barrier()
                 with torch.no_grad():
                     result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-                dist.barrier()
 
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
@@ -714,7 +752,8 @@ class WebsocketPolicyServer:
 
 def init_mesh(sp_size: int = 1) -> DeviceMesh:
     # env vars set by torchrun
-    dist.init_process_group("nccl")
+    # 2-hour timeout: torch.compile reduce-overhead can take 20+ min to compile
+    dist.init_process_group("nccl", timeout=datetime.timedelta(hours=2))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     print(f"Rank {rank}/{world_size} (PID: {os.getpid()}) setting device to {rank}")
@@ -757,7 +796,8 @@ def main(args: Args) -> None:
 
     # Increase the recompile limit to 100 for inference due
     # to autoregressive nature of the model (several possible shapes).
-    torch._dynamo.config.recompile_limit = 800
+    if hasattr(torch._dynamo.config, 'recompile_limit'):
+        torch._dynamo.config.recompile_limit = 800
 
     embodiment_tag = "oxe_droid"
     model_path = args.model_path
@@ -799,6 +839,93 @@ def main(args: Args) -> None:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
     
+    # === GRAPH DEBUG TEST ===
+    if os.environ.get("GRAPH_DEBUG_TEST") == "1":
+        import gc
+        _dit = policy.trained_model.action_head.model
+        # Use first-call kwargs (small KV caches) to test graph without pool size issues
+        _dump_path = "/mnt/localssd/dreamzero/fwd_kwargs_dump.pt"
+        _dump = torch.load(_dump_path, map_location=f"cuda:{rank}", weights_only=False)
+        _kwargs = {}
+        for _k, _v in _dump.items():
+            if isinstance(_v, torch.Tensor):
+                _kwargs[_k] = _v.to(f"cuda:{rank}")
+            elif isinstance(_v, list):
+                _kwargs[_k] = [_t.to(f"cuda:{rank}") if isinstance(_t, torch.Tensor) else _t for _t in _v]
+            else:
+                _kwargs[_k] = _v
+        # Ensure all required kwargs are present (some may be None in dump)
+        for _required in ("embodiment_id", "action", "timestep_action", "state"):
+            if _required not in _kwargs:
+                _kwargs[_required] = None
+        if rank == 0:
+            print("[GRAPH_DEBUG] Running graph capture/replay test...")
+        # 3 eager warmups
+        for _w in range(3):
+            with torch.no_grad():
+                _o = _dit._forward_blocks(**_kwargs)
+            for _i, _kv in enumerate(_o[2]):
+                if isinstance(_kv, torch.Tensor):
+                    _kwargs["kv_cache"][_i] = _kv
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(f"[GRAPH_DEBUG] Warmup {_w}: OK")
+        # Clone static
+        _static, _tkeys = {}, []
+        for _k, _v in _kwargs.items():
+            if isinstance(_v, torch.Tensor):
+                _static[_k] = _v.clone()
+                _tkeys.append(_k)
+            elif isinstance(_v, list):
+                _static[_k] = _v
+            else:
+                _static[_k] = _v
+        # Capture warmup
+        torch.cuda.synchronize()
+        dist.barrier()
+        with torch.no_grad():
+            _ = _dit._forward_blocks(**_static)
+        torch.cuda.synchronize()
+        dist.barrier()
+        # Capture
+        _pool = torch.cuda.graph_pool_handle()
+        _graph = torch.cuda.CUDAGraph()
+        gc.disable()
+        try:
+            with torch.no_grad(), torch.cuda.graph(_graph, pool=_pool):
+                _static_out = _dit._forward_blocks(**_static)
+            gc.enable()
+            torch.cuda.synchronize()
+            if rank == 0:
+                print("[GRAPH_DEBUG] Capture OK!")
+        except Exception as _e:
+            gc.enable()
+            if rank == 0:
+                print(f"[GRAPH_DEBUG] Capture FAILED: {_e}")
+                import traceback; traceback.print_exc()
+            dist.barrier()
+            sys.exit(1)
+        dist.barrier()
+        # Replay
+        for _rep in range(5):
+            # SKIP copy_ to test if the segfault is from copy or replay
+            # for _k in _tkeys:
+            #     _static[_k].copy_(_kwargs[_k])
+            try:
+                _graph.replay()
+                torch.cuda.synchronize()
+                _norm = _static_out[0].norm().item()
+                if rank == 0:
+                    print(f"[GRAPH_DEBUG] Replay {_rep}: norm={_norm:.2f}")
+            except Exception as _e:
+                if rank == 0:
+                    print(f"[GRAPH_DEBUG] Replay {_rep} FAILED: {_e}")
+                break
+        if rank == 0:
+            print("[GRAPH_DEBUG] Test complete!")
+        dist.barrier()
+        sys.exit(0)
+
     # Create wrapper policy that converts between roboarena and AR_droid formats
     wrapper_policy = ARDroidRoboarenaPolicy(
         groot_policy=policy,
@@ -816,6 +943,95 @@ def main(args: Args) -> None:
         action_space="joint_position",
     )
     
+    # === COMPILE WARMUP ===
+    # When using COMPILE_DIT with reduce-overhead, the first calls trigger
+    # expensive torch.compile + CUDA graph capture (~80s each). We pre-warm
+    # all unique shapes here so the server is fast from the first real request.
+    _warmup_chunks = int(os.environ.get("COMPILE_WARMUP_CHUNKS", "0"))
+    _compile_dit = os.environ.get("COMPILE_DIT", "false").lower() == "true"
+    if _warmup_chunks > 0 and _compile_dit:
+        if rank == 0:
+            logging.info(f"==> Running {_warmup_chunks} warmup chunks to pre-compile CUDA graphs...")
+
+        # Create synthetic observations (180x320 random images, dummy state)
+        H, W = 180, 320
+        _dummy_obs = {
+            "observation/exterior_image_0_left": np.random.randint(0, 255, (1, H, W, 3), dtype=np.uint8),
+            "observation/exterior_image_1_left": np.random.randint(0, 255, (1, H, W, 3), dtype=np.uint8),
+            "observation/wrist_image_left": np.random.randint(0, 255, (1, H, W, 3), dtype=np.uint8),
+            "observation/joint_position": np.zeros(7, dtype=np.float32),
+            "observation/gripper_position": np.zeros(1, dtype=np.float32),
+            "prompt": "Move the object forward and place it on the table in front of you carefully",
+            "session_id": "__warmup__",
+        }
+        # Multi-frame obs for continuation chunks
+        _dummy_obs_multi = {
+            **_dummy_obs,
+            "observation/exterior_image_0_left": np.random.randint(0, 255, (4, H, W, 3), dtype=np.uint8),
+            "observation/exterior_image_1_left": np.random.randint(0, 255, (4, H, W, 3), dtype=np.uint8),
+            "observation/wrist_image_left": np.random.randint(0, 255, (4, H, W, 3), dtype=np.uint8),
+        }
+
+        # Use the EXACT same code path as real serving:
+        # rank 0 calls infer() (broadcasts signal+obs, runs inference)
+        # rank 1-7 run _worker_loop iterations (receive signal+obs, run inference)
+        # This ensures the compiled graphs match real-client requests.
+        _saved_overlap = os.environ.get("OVERLAP_VAE_DIT", "false")
+        os.environ["OVERLAP_VAE_DIT"] = "false"
+
+        # Create a temporary WebsocketPolicyServer for non-rank-0 worker loop
+        _warmup_server = WebsocketPolicyServer(
+            policy=policy,
+            host="0.0.0.0",
+            port=args.port + 100,  # dummy port, never used
+            metadata=policy_metadata,
+            output_dir=None,
+            signal_group=signal_group,
+        )
+
+        import time as _time
+        import threading
+
+        for _wi in range(_warmup_chunks):
+            _obs = _dummy_obs if _wi == 0 else _dummy_obs_multi
+            _t0 = _time.time()
+            try:
+                if rank == 0:
+                    # Rank 0: full infer() path (broadcasts + inference)
+                    with torch.no_grad():
+                        wrapper_policy.infer(_obs)
+                    # Clear deferred work
+                    _ah = wrapper_policy._policy.trained_model.action_head
+                    if hasattr(_ah, '_pending_deferred'):
+                        _ah._pending_deferred = None
+                else:
+                    # Rank 1-7: one iteration of worker loop (receives + inference)
+                    signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+                    dist.broadcast(signal_tensor, src=0, group=signal_group)
+                    batch = _warmup_server._receive_batch_from_rank0()
+                    with torch.no_grad():
+                        _warmup_server._policy.lazy_joint_forward_causal(batch)
+            except Exception as _e:
+                if rank == 0:
+                    logging.warning(f"Warmup chunk {_wi} error (non-fatal): {_e}")
+            _elapsed = _time.time() - _t0
+            if rank == 0:
+                logging.info(f"  Warmup chunk {_wi}/{_warmup_chunks}: {_elapsed:.1f}s")
+            torch.cuda.synchronize()
+            dist.barrier()
+
+        # Restore overlap setting
+        os.environ["OVERLAP_VAE_DIT"] = _saved_overlap
+
+        # Reset wrapper state so first real client starts fresh
+        wrapper_policy._reset_state(save_video=False)
+        wrapper_policy._current_session_id = None
+        wrapper_policy._is_first_call = True
+        wrapper_policy._call_count = 0
+        if rank == 0:
+            logging.info(f"==> Warmup complete. Server ready for real requests.")
+
+    # === START SERVER ===
     if rank == 0:
         logging.info("Using roboarena policy server interface")
         logging.info(f"Server config: {server_config}")

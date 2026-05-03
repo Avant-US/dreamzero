@@ -4,6 +4,41 @@ __pycache__/
 *$py.class
 wandb/
 
+# Model weights & large binaries
+huggingface_checkpoints/
+*.safetensors
+*.pth
+*.trt
+*.onnx
+*.onnx_data
+*.bin
+
+# Generated videos & evaluation outputs
+real_world_eval_gen_*/
+*.mp4
+
+# Profiling & benchmark artifacts
+*.jsonl
+bench_reports/
+reduce_overhead_profile.jsonl
+trimkv_profile.jsonl
+capture_kwargs_dump.pt
+fwd_kwargs_dump.pt
+
+# Runtime caches
+.cuda_home_stub/
+torchinductor_cache*/
+hf_cache/
+
+# Temp & debug files
+00000000000
+report_*.txt
+benchmark_results.txt
+math500_*
+eval_math500.py
+profiling/
+files/
+
 # C extensions
 
 
@@ -244,3 +279,10 @@ groot/control/envs/yam/data/eval/*
 
 checkpoints/
 video_pred_output*/
+
+# Debug/test scripts
+test_graph_*.py
+test_pynccl_*.py
+test_preprocess_*.py
+trace_*.json
+video_comparison/

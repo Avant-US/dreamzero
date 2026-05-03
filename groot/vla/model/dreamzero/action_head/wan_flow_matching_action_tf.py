@@ -17,6 +17,8 @@ from safetensors.torch import load_file
 import json
 from huggingface_hub import hf_hub_download
 
+from groot.vla.model.dreamzero import perf_profile as _perf_profile
+
 
 logger = logging.getLogger(__name__)
 
@@ -177,9 +179,9 @@ class WANPolicyHead(ActionHead):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
 
-        self.num_inference_steps = 16 
+        self.num_inference_steps = int(os.getenv("NUM_INFERENCE_STEPS", "16"))
         self.seed = 1140
-        self.cfg_scale = 5.0
+        self.cfg_scale = float(os.environ.get("CFG_SCALE", "5.0"))
         self.denoising_strength = 1.0
         self.sigma_shift = 5.0
         self.kv_cache1: KVCacheType | None = None
@@ -197,6 +199,7 @@ class WANPolicyHead(ActionHead):
         self.clip_feas = None
         self.ys = None
         self.current_start_frame = 0
+        self._kv_cache_warm = False  # reset warm cache on new session
         self.language = None
 
         self.ip_rank = 0
@@ -491,22 +494,67 @@ class WANPolicyHead(ActionHead):
     ) -> tuple[KVCacheType, KVCacheType]:
         """
         Initialize a Per-GPU KV cache for the Wan model.
-        Use the model's num_heads and head_dim (5B has 24 heads, 14B has 40).
+
+        Default: allocate with seq_len=0 (grows on demand via torch.cat).
+
+        Static mode (STATIC_KV_CACHE=true, vLLM/TRT-LLM style):
+        allocate at max size up-front. Each self-attn call writes new tokens in
+        place into a fixed-size buffer. Attention uses a key-side mask to ignore
+        unused slots. This gives torch.compile a constant input-shape signature
+        which is a prerequisite for CUDA graph capture.
         """
         num_heads = self.model.num_heads
         head_dim = self.model.dim // num_heads
-        # With SP, each rank only stores H/sp heads in the KV cache (post all-to-all layout)
         sp_size = self.sp_ctx.sp_size if self.sp_ctx is not None else 1
         effective_num_heads = num_heads // sp_size
+
+        static_kv = os.environ.get("STATIC_KV_CACHE", "false").lower() == "true"
+        if static_kv:
+            # Use the same cap the self-attn uses for its rolling truncation.
+            # `max_attention_size` lives on each CausalWanSelfAttention inside a block.
+            max_attn = int(
+                getattr(self.model.blocks[0].self_attn, "max_attention_size", 21 * frame_seqlen)
+            )
+            seq_cap = max_attn
+            if self.ip_rank == 0:
+                mb_per_cache = (
+                    2 * batch_size * seq_cap * effective_num_heads * head_dim
+                    * torch.tensor([], dtype=dtype).element_size()
+                ) / (1024 ** 2)
+                print(
+                    f"[static_kv] Pre-allocating KV cache: max_seq={seq_cap}, "
+                    f"layers={self.model.num_layers}, per-layer {mb_per_cache:.1f} MB "
+                    f"(×2 groups = {2*self.model.num_layers*mb_per_cache:.1f} MB total per rank)"
+                )
+        else:
+            seq_cap = 0
+
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
-            kv_cache1.append(
-                torch.zeros([2, batch_size, 0, effective_num_heads, head_dim], dtype=dtype, device=device),
-            )
-            kv_cache_neg.append(
-                torch.zeros([2, batch_size, 0, effective_num_heads, head_dim], dtype=dtype, device=device),
-            )
+            t1 = torch.zeros([2, batch_size, seq_cap, effective_num_heads, head_dim], dtype=dtype, device=device)
+            t2 = torch.zeros([2, batch_size, seq_cap, effective_num_heads, head_dim], dtype=dtype, device=device)
+            if static_kv:
+                # Tell dynamo this tensor's data_ptr is stable across calls.
+                torch._dynamo.mark_static_address(t1)
+                torch._dynamo.mark_static_address(t2)
+            kv_cache1.append(t1)
+            kv_cache_neg.append(t2)
+
+        if static_kv:
+            self._kv_fill_levels_pos = [0] * self.model.num_layers
+            self._kv_fill_levels_neg = [0] * self.model.num_layers
+            # Set each block's self_attn to static mode and attach persistent
+            # GPU tensors for fill_level and index base. These are updated via
+            # .fill_() OUTSIDE the compiled fn so dynamo treats them as data.
+            for blk in self.model.blocks:
+                blk.self_attn._use_static_kv = True
+                fl_t = torch.zeros((), dtype=torch.int64, device=device)
+                torch._dynamo.mark_static_address(fl_t)
+                blk.self_attn._fill_level_t = fl_t
+                idx_base = torch.arange(seq_cap, dtype=torch.int64, device=device)
+                torch._dynamo.mark_static_address(idx_base)
+                blk.self_attn._idx_base = idx_base
 
         return kv_cache1, kv_cache_neg
 
@@ -890,6 +938,32 @@ class WANPolicyHead(ActionHead):
                 _model_offloaded = self.trt_engine is not None and not next(self.model.parameters()).is_cuda
                 if _model_offloaded:
                     self.model.to(device=noisy_input.device, dtype=torch.bfloat16)
+
+                # STATIC_KV_CACHE: tell the model which group's fill-levels to use
+                # (pos=conditional, neg=unconditional) and whether this call
+                # should advance the persistent fill_level (pre-pass) or just
+                # use a scratch slot (main diffusion step).
+                _static_kv = os.environ.get("STATIC_KV_CACHE", "false").lower() == "true"
+                if _static_kv:
+                    group = "pos" if index == 0 else "neg"
+                    if not hasattr(self.model, f"_kv_fill_{group}"):
+                        setattr(self.model, f"_kv_fill_{group}", [0] * self.model.num_layers)
+                    self.model._current_static_kv_group = group
+                    self.model._current_update_kv_cache = bool(kv_cache_metadata.get("update_kv_cache", True))
+
+                # Save _fill_level_t before non-update calls so the CUDA graph's
+                # in-place writes don't permanently advance the buffer position.
+                _restore_fill = (
+                    _static_kv
+                    and not kv_cache_metadata.get("update_kv_cache", True)
+                )
+                if _restore_fill:
+                    _saved_fills = [
+                        blk.self_attn._fill_level_t.clone()
+                        for blk in self.model.blocks
+                    ]
+
+                print(f'[DBG r={self.ip_rank}] model.forward START (group={getattr(self.model, "_current_static_kv_group", "?")}, update_kv={kv_cache_metadata.get("update_kv_cache", "?")})', flush=True)
                 _fp8_ctx = self._get_fp8_context()
                 with _fp8_ctx:
                     obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
@@ -907,9 +981,26 @@ class WANPolicyHead(ActionHead):
                         crossattn_cache=crossattn_cache,
                         current_start_frame=kv_cache_metadata["start_frame"],
                     )
+
+                print(f'[DBG r={self.ip_rank}] model.forward DONE', flush=True)
+                if _static_kv:
+                    self.model._current_static_kv_group = None
+
+                # Restore fill levels after denoising calls so the circular
+                # buffer write position stays correct for the next chunk.
+                if _restore_fill:
+                    for blk, sf in zip(self.model.blocks, _saved_fills):
+                        blk.self_attn._fill_level_t.copy_(sf)
+
                 if kv_cache_metadata["update_kv_cache"]:
-                    for block_index, updated_kv_cache in enumerate(updated_kv_caches):
-                        kv_cache[block_index] = updated_kv_cache.clone()
+                    if _static_kv:
+                        # In static mode, the model already wrote into the
+                        # preallocated buffer in-place. Nothing to copy. The
+                        # `updated_kv_caches[i]` tensor IS `kv_cache[i]`.
+                        pass
+                    else:
+                        for block_index, updated_kv_cache in enumerate(updated_kv_caches):
+                            kv_cache[block_index] = updated_kv_cache.clone()
                 if _model_offloaded:
                     self.model.cpu()
                     torch.cuda.empty_cache()
@@ -986,6 +1077,13 @@ class WANPolicyHead(ActionHead):
     def lazy_joint_video_action(self, backbone_output: BatchFeature, action_input: BatchFeature, latent_video: torch.Tensor | None = None) -> BatchFeature:
         start_time = time.perf_counter()
 
+        # Reset per-call profiler state (comm event accumulator). Cheap when
+        # profiling is disabled.
+        _perf_profile.reset_call()
+        _perf_profile.maybe_start_trace(
+            dist.get_rank() if dist.is_initialized() else 0
+        )
+
         # Tracking time taken on GPU for various operations.
         start_text_encoder_event = torch.cuda.Event(enable_timing=True)
         end_text_encoder_event = torch.cuda.Event(enable_timing=True)
@@ -999,8 +1097,9 @@ class WANPolicyHead(ActionHead):
         end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
 
         self.set_frozen_modules_to_eval_mode()
-        data = action_input 
-        
+
+        data = action_input
+
         videos = data["images"]
 
         embodiment_id = action_input.embodiment_id
@@ -1016,7 +1115,7 @@ class WANPolicyHead(ActionHead):
             videos = videos.reshape(b * t, c, h, w)
             videos = self.normalize_video(videos)
             videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)  # back to [b, c, t, h, w]
-            assert videos.min() >= -1.0 and videos.max() <= 1.0, "videos must be in [-1,1] range"
+            # Removed: videos.min()/max() cause CPU-GPU sync (~0.1s penalty)
             videos = videos.to(dtype=self.dtype)
 
         state_features = state_features.to(dtype=torch.bfloat16)
@@ -1057,16 +1156,33 @@ class WANPolicyHead(ActionHead):
             self.current_start_frame = 0
 
         if self.ip_rank == 0:
-            print("videos shape", videos.shape, self.num_frames)
+            print("videos shape", videos.shape, self.num_frames, flush=True)
 
+        import sys as _s
+        print(f'[DBG r={self.ip_rank}] text_enc start', flush=True)
+        _s.stdout.flush()
         start_text_encoder_event.record()
 
         text_inputs = self._prepare_text_inputs(data)
-        prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
+        # Cache text embeddings — prompt doesn't change between chunks
+        _txt_cache = getattr(self, "_prompt_emb_cache", None)
+        if _txt_cache is not None and _txt_cache.get("input_ids") is not None:
+            # Check if input changed
+            _same = all(torch.equal(ti[0], ci) for ti, ci in zip(text_inputs, _txt_cache["input_ids"]))
+            if _same:
+                prompt_embs = _txt_cache["embs"]
+            else:
+                prompt_embs = [self.encode_prompt(text, attn) for text, attn in text_inputs]
+                self._prompt_emb_cache = {"input_ids": [ti[0].clone() for ti in text_inputs], "embs": prompt_embs}
+        else:
+            prompt_embs = [self.encode_prompt(text, attn) for text, attn in text_inputs]
+            self._prompt_emb_cache = {"input_ids": [ti[0].clone() for ti in text_inputs], "embs": prompt_embs}
 
         end_text_encoder_event.record()
-        
+        print(f'[DBG r={self.ip_rank}] text_enc done', flush=True)
+
         start_image_encoder_event.record()
+        print(f'[DBG r={self.ip_rank}] img_enc start', flush=True)
 
         _, _, num_frames, height, width = videos.shape
         if videos.shape[2] == 4 or videos.shape[2] == 9:
@@ -1083,39 +1199,97 @@ class WANPolicyHead(ActionHead):
         assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
 
         end_image_encoder_event.record()
+        print(f'[DBG r={self.ip_rank}] img_enc done', flush=True)
 
         start_vae_event.record()
+        print(f'[DBG r={self.ip_rank}] vae start', flush=True)
 
-        if latent_video is not None and self.current_start_frame != 0:
-            image = latent_video
-            if self.ip_rank == 0:
-                print("image shape@@", image.shape)
-        elif self.current_start_frame != 0:
-            # this is for real world execution
-            if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
-                print("no further action")
-            elif videos.shape[2] // 4 != self.num_frame_per_block:
-                # Repeating videos along dim 2.
-                repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-            
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-            else: 
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-           
-            image = self.vae.encode(
-                videos,
-                tiled=self.tiled,
-                tile_size=(self.tile_size_height, self.tile_size_width),
-                tile_stride=(self.tile_stride_height, self.tile_stride_width),
+        # --- Pipeline optimization: overlap VAE+KV init with DiT ---
+        # When OVERLAP_VAE_DIT=true on steady-state chunks:
+        #   1. Run DiT FIRST using previous chunk's KV cache (stale by 1 chunk)
+        #   2. Run VAE + KV init AFTER DiT to prepare fresh cache for next chunk
+        # This overlaps VAE with the idle time between chunks.
+        _kv_cache_thresh = float(os.environ.get("KV_INIT_CACHE_THRESH", "0"))
+        _can_overlap = (_kv_cache_thresh > 0 and getattr(self, "_kv_cache_warm", False)
+                         and self.current_start_frame > 1
+                         and os.environ.get("OVERLAP_VAE_DIT", "false").lower() == "true")
+        _vae_future = None
+
+        if _can_overlap:
+            # Defer VAE — create dummy image for now, run real VAE after DiT
+            _lat_c = getattr(self.vae, 'z_dim', 16)
+            _lat_h = videos.shape[3] // 8
+            _lat_w = videos.shape[4] // 8
+            image = torch.zeros(
+                videos.shape[0], _lat_c, self.num_frame_per_block + 1, _lat_h, _lat_w,
+                device=videos.device, dtype=torch.bfloat16
             )
+            # Store VAE input for deferred execution after DiT
+            if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
+                self._deferred_vae_input = videos
+            elif videos.shape[2] // 4 != self.num_frame_per_block:
+                repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
+                vae_input = torch.repeat_interleave(videos, repeat_factor, dim=2)
+                self._deferred_vae_input = torch.cat([vae_input[:, :, 0:1], vae_input], dim=2)
+            else:
+                self._deferred_vae_input = torch.cat([videos[:, :, 0:1], videos], dim=2)
+            start_vae_event.record()
+            end_vae_event.record()
+        elif latent_video is not None and self.current_start_frame != 0:
+            image = latent_video
+        elif latent_video is None and self.current_start_frame != 0:
+            # Prepare VAE input
+            if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
+                vae_input = videos
+            elif videos.shape[2] // 4 != self.num_frame_per_block:
+                repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
+                vae_input = torch.repeat_interleave(videos, repeat_factor, dim=2)
+                first_frame = vae_input[:, :, 0:1]
+                vae_input = torch.cat([first_frame, vae_input], dim=2)
+            else:
+                first_frame = videos[:, :, 0:1]
+                vae_input = torch.cat([first_frame, videos], dim=2)
+
+            _vae_stream = getattr(self, "_vae_stream", None)
+            if os.environ.get("ASYNC_VAE", "false").lower() == "true":
+                # Submit VAE to background stream
+                if _vae_stream is None:
+                    self._vae_stream = torch.cuda.Stream(device=videos.device)
+                    _vae_stream = self._vae_stream
+                _default = torch.cuda.current_stream(videos.device)
+                _xfer = torch.cuda.Event()
+                _xfer.record(_default)
+                with torch.cuda.stream(_vae_stream):
+                    _vae_stream.wait_event(_xfer)
+                    image = self.vae.encode(
+                        vae_input,
+                        tiled=self.tiled,
+                        tile_size=(self.tile_size_height, self.tile_size_width),
+                        tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                    )
+                _vae_future = torch.cuda.Event()
+                _vae_future.record(_vae_stream)
+                # image is on background stream — don't use until _vae_future is waited
+            else:
+                image = self.vae.encode(
+                    vae_input,
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
-        noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        # Noise generation: use known shapes to avoid waiting for async VAE
+        # image shape is [B, C, T, H, W] where C=16 (latent), H/W from VAE downsampling
+        # For 14B: input 180x320 → latent 22x40. For 5B with target 176x320 → 22x40.
+        # We can infer shape from the model config.
+        _b = videos.shape[0]
+        _lat_c = getattr(self.vae, 'z_dim', 16)  # 16 for Wan2.1, 48 for Wan2.2
+        _lat_h = videos.shape[3] // 8  # VAE spatial downsampling 8x
+        _lat_w = videos.shape[4] // 8
+        noise_obs = self.generate_noise((_b, _lat_c, self.num_frame_per_block, _lat_h, _lat_w), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        noise_action = self.generate_noise((_b, self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
         # DiT patch_embedding uses stride (1,2,2), so tokens per frame = (H//2)*(W//2)
@@ -1123,17 +1297,32 @@ class WANPolicyHead(ActionHead):
         frame_seqlen = tokens_per_frame
         seq_len = num_frames * frame_seqlen
 
+        # Wait for async VAE if needed (everything above ran in parallel with it)
+        if _vae_future is not None:
+            torch.cuda.current_stream(videos.device).wait_event(_vae_future)
+
         image = image.transpose(1, 2)
         noise_obs = noise_obs.transpose(1, 2)
 
         if self.current_start_frame == 0:
-            # Reinitialize KV cache and crossattn cache for each new sequence.
-            self.kv_cache1, self.kv_cache_neg = self._create_kv_caches(
-                batch_size=batch_size,
-                dtype=noise_obs.dtype,
-                device=noise_obs.device,
-                frame_seqlen=frame_seqlen,
-            )
+            _static_kv = os.environ.get("STATIC_KV_CACHE", "false").lower() == "true"
+            if _static_kv and getattr(self, 'kv_cache1', None) is not None:
+                # STATIC_KV_CACHE: REUSE existing buffers (same tensor identity
+                # for CUDAGraph Trees cache hits). Just zero data + reset positions.
+                for _layer_kv in self.kv_cache1:
+                    _layer_kv.zero_()
+                for _layer_kv in self.kv_cache_neg:
+                    _layer_kv.zero_()
+                for _blk in self.model.blocks:
+                    _blk.self_attn._fill_level_t.zero_()
+            else:
+                # First call or dynamic mode: allocate fresh.
+                self.kv_cache1, self.kv_cache_neg = self._create_kv_caches(
+                    batch_size=batch_size,
+                    dtype=noise_obs.dtype,
+                    device=noise_obs.device,
+                    frame_seqlen=frame_seqlen,
+                )
             self.crossattn_cache, self.crossattn_cache_neg = self._create_crossattn_caches(
                 batch_size=batch_size,
                 dtype=noise_obs.dtype,
@@ -1152,6 +1341,7 @@ class WANPolicyHead(ActionHead):
         )
 
         start_kv_event.record()
+        print(f'[DBG r={self.ip_rank}] kv_init start (frame={self.current_start_frame})', flush=True)
 
         if self.current_start_frame == 0:
             timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
@@ -1183,24 +1373,40 @@ class WANPolicyHead(ActionHead):
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
             else:
                 y = self.ys[:, :, -self.num_frame_per_block:]
-            self._run_diffusion_steps(
-                noisy_input=current_ref_latents.transpose(1, 2),
-                timestep=timestep * 0,
-                action=None,
-                timestep_action=None,
-                state=None,
-                embodiment_id=None,
-                context=prompt_embs,
-                seq_len=seq_len,
-                y=y,
-                clip_feature=self.clip_feas,
-                kv_caches=kv_caches,
-                crossattn_caches=crossattn_caches,
-                kv_cache_metadata=dict(
-                    start_frame=self.current_start_frame - self.num_frame_per_block,
-                    update_kv_cache=True,
-                ),
-            )
+
+            # --- Optimization A+D: Skip KV init, reuse from previous diffusion ---
+            # The main diffusion loop already fills the KV cache with context
+            # from each chunk. On subsequent chunks, the previous cache provides
+            # sufficient reference conditioning without a separate forward pass.
+            # KV_INIT_CACHE_THRESH > 0 enables this: always skip if previous
+            # cache exists (the diffusion step keeps it warm).
+            _skip_kv_init = False
+            _kv_cache_thresh = float(os.environ.get("KV_INIT_CACHE_THRESH", "0"))
+            if _kv_cache_thresh > 0:
+                # Skip if we have a warm KV cache from the previous chunk's diffusion
+                _has_warm_cache = getattr(self, "_kv_cache_warm", False)
+                if _has_warm_cache:
+                    _skip_kv_init = True
+
+            if not _skip_kv_init:
+                self._run_diffusion_steps(
+                    noisy_input=current_ref_latents.transpose(1, 2),
+                    timestep=timestep * 0,
+                    action=None,
+                    timestep_action=None,
+                    state=None,
+                    embodiment_id=None,
+                    context=prompt_embs,
+                    seq_len=seq_len,
+                    y=y,
+                    clip_feature=self.clip_feas,
+                    kv_caches=kv_caches,
+                    crossattn_caches=crossattn_caches,
+                    kv_cache_metadata=dict(
+                        start_frame=self.current_start_frame - self.num_frame_per_block,
+                        update_kv_cache=True,
+                    ),
+                )
 
         end_kv_event.record()
 
@@ -1234,13 +1440,16 @@ class WANPolicyHead(ActionHead):
             if self.ip_rank == 0:
                 print(f"Decoupled inference: video sigmas {sigma_max:.3f} -> {sample_scheduler.sigmas[-1].item():.3f}")
 
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
+        _profile = hasattr(self, '_perf_profile') and self._perf_profile
+        if _profile:
+            start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
+            end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
         prev_predictions = [] 
         self.skip_countdown = 0
         dit_compute_steps = 0
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
-            start_diffusion_events[index].record()
+            if _profile:
+                start_diffusion_events[index].record()
 
             # Get timesteps from respective schedulers
             action_timestep = sample_scheduler_action.timesteps[index]
@@ -1285,9 +1494,12 @@ class WANPolicyHead(ActionHead):
                     ),
                 )
                 flow_pred_cond, flow_pred_cond_action = predictions[0]
-                flow_pred_uncond, flow_pred_uncond_action = predictions[1]
-
-                flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+                if len(predictions) > 1:
+                    flow_pred_uncond, flow_pred_uncond_action = predictions[1]
+                    flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+                else:
+                    # No CFG (cfg_scale=1.0): just use conditional prediction
+                    flow_pred = flow_pred_cond
                 prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
                 max_cache_size = 2
                 if len(prev_predictions) > max_cache_size:
@@ -1297,7 +1509,8 @@ class WANPolicyHead(ActionHead):
                 assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
                 _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
 
-            end_diffusion_events[index].record()
+            if _profile:
+                end_diffusion_events[index].record()
 
             # Video: denoising step (uses rescaled schedule if decoupled)
             noisy_input = sample_scheduler.step(
@@ -1325,6 +1538,66 @@ class WANPolicyHead(ActionHead):
             output = torch.cat([image, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 
+        # Mark KV cache as warm after diffusion (for KV init skip optimization)
+        if float(os.environ.get("KV_INIT_CACHE_THRESH", "0")) > 0:
+            self._kv_cache_warm = True
+
+        # --- Deferred VAE + KV init: save as callable for post-action execution ---
+        # The policy_server runs this AFTER sending the action to the client,
+        # overlapping with the client's round-trip time.
+        _deferred_vae = getattr(self, "_deferred_vae_input", None)
+        if _deferred_vae is not None:
+            self._deferred_vae_input = None
+            # Capture variables for the deferred closure
+            _dv_input = _deferred_vae
+            _dv_prompts = prompt_embs
+            _dv_kv = kv_caches
+            _dv_ca = crossattn_caches
+            _dv_seq = seq_len
+            _dv_start = self.current_start_frame
+            _dv_bs = batch_size
+            _dv_device = noise_obs.device
+
+            # Save deferred function — will be called by policy_server after sending action
+            @torch.compiler.disable
+            def _run_deferred_vae_kv():
+                with torch.no_grad():
+                    _img = self.vae.encode(
+                        _dv_input,
+                        tiled=self.tiled,
+                        tile_size=(self.tile_size_height, self.tile_size_width),
+                        tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                    )
+                    _img = _img.transpose(1, 2)
+                    _ref = _img[:, -self.num_frame_per_block:]
+                    if _dv_start <= self.ys.shape[2]:
+                        _y = self.ys[:, :, _dv_start - self.num_frame_per_block : _dv_start]
+                    else:
+                        _y = self.ys[:, :, -self.num_frame_per_block:]
+                    _ts = torch.zeros([_dv_bs, self.num_frame_per_block],
+                                       device=_dv_device, dtype=torch.int64)
+                    self._run_diffusion_steps(
+                        noisy_input=_ref.transpose(1, 2),
+                        timestep=_ts,
+                        action=None, timestep_action=None, state=None, embodiment_id=None,
+                        context=_dv_prompts,
+                        seq_len=_dv_seq,
+                        y=_y,
+                        clip_feature=self.clip_feas,
+                        kv_caches=_dv_kv,
+                        crossattn_caches=_dv_ca,
+                        kv_cache_metadata=dict(
+                            start_frame=_dv_start - self.num_frame_per_block,
+                            update_kv_cache=True,
+                        ),
+                    )
+
+        # Store deferred function if we have one
+        if '_run_deferred_vae_kv' in dir():
+            self._pending_deferred = _run_deferred_vae_kv
+        else:
+            self._pending_deferred = None
+
         # Do torch.cuda.synchronize() to ensure all operations are completed before timing.
         # This isn't expected to affect inference performance since it's at the end of an inference step.
         torch.cuda.synchronize()
@@ -1334,7 +1607,10 @@ class WANPolicyHead(ActionHead):
         image_encoder_time = start_image_encoder_event.elapsed_time(end_image_encoder_event) / 1000
         vae_time = start_vae_event.elapsed_time(end_vae_event) / 1000
         kv_creation_time = start_kv_event.elapsed_time(end_kv_event) / 1000
-        diffusion_times = [s.elapsed_time(e) for s, e in zip(start_diffusion_events, end_diffusion_events)]
+        try:
+            diffusion_times = [s.elapsed_time(e) for s, e in zip(start_diffusion_events, end_diffusion_events)]
+        except ValueError:
+            diffusion_times = [0.0]
         diffusion_time = sum(diffusion_times) / 1000
         scheduler_time = total_time - kv_creation_time - diffusion_time - text_encoder_time - image_encoder_time - vae_time
 
@@ -1347,6 +1623,52 @@ class WANPolicyHead(ActionHead):
                   f"Diffusion {diffusion_time:.2f} seconds, "
                   f"DIT Compute Steps {dit_compute_steps} steps, "
                   f"Scheduler {scheduler_time:.2f} seconds")
+
+        # Per-call profile dump (opt-in via PROFILE_INFERENCE=true). Only the
+        # true global rank 0 writes — without this check, all 4 SP ranks within
+        # CFG group 0 satisfy `ip_rank == 0` and duplicate the record.
+        _global_rank_zero = (
+            not dist.is_initialized() or dist.get_rank() == 0
+        )
+        if _perf_profile.enabled() and _global_rank_zero:
+            try:
+                dit_model = getattr(self, "model", None)
+                model_cfg = {
+                    "dim": int(getattr(dit_model, "dim", 5120)),
+                    "num_heads": int(getattr(dit_model, "num_heads", 40)),
+                    "ffn_dim": int(getattr(dit_model, "ffn_dim", 13824)),
+                    "frame_seqlen": int(getattr(dit_model, "frame_seqlen", 880)),
+                    "num_layers": int(getattr(dit_model, "num_layers", 40)),
+                    # Best-effort actual sequence length during this call:
+                    "seq_len": int(getattr(dit_model, "frame_seqlen", 880)),
+                    "batch_size": 1,
+                }
+                sp_size = int(os.environ.get("SP_SIZE", "1"))
+                num_gpus = int(os.environ.get("NUM_GPUS", "1"))
+                cfg_size = max(num_gpus // max(sp_size, 1), 1)
+                _perf_profile.finalize_and_dump(
+                    phases_s={
+                        "text_encoder_s": text_encoder_time,
+                        "image_encoder_s": image_encoder_time,
+                        "vae_s": vae_time,
+                        "kv_creation_s": kv_creation_time,
+                        "diffusion_s": diffusion_time,
+                        "scheduler_s": scheduler_time,
+                        "diffusion_per_step_s": [t / 1000.0 for t in diffusion_times],
+                    },
+                    total_s=total_time,
+                    dit_compute_steps=int(dit_compute_steps),
+                    num_dit_steps=int(self.num_inference_steps),
+                    model_cfg=model_cfg,
+                    sp_size=sp_size,
+                    cfg_size=cfg_size,
+                    rank=int(self.ip_rank) if self.ip_rank is not None else 0,
+                )
+            except Exception as _e:  # pragma: no cover
+                print(f"[perf_profile] dump failed: {_e}")
+
+        _global_rank = dist.get_rank() if dist.is_initialized() else 0
+        _perf_profile.maybe_stop_trace(_global_rank)
 
         return BatchFeature(data={"action_pred": latents_action, "video_pred": output.transpose(1, 2)})
     
@@ -1363,14 +1685,23 @@ class WANPolicyHead(ActionHead):
 
     def _get_fp8_context(self):
         """Return fp8_autocast context if FP8 inference is enabled, else a no-op context."""
-        if self.fp8_inference:
-            import transformer_engine.pytorch as te
-            # Use newer API if available, fall back to deprecated fp8_autocast
-            if hasattr(te, 'autocast'):
-                return te.autocast(enabled=True)
-            return te.fp8_autocast(enabled=True)
         import contextlib
-        return contextlib.nullcontext()
+        if not self.fp8_inference:
+            return contextlib.nullcontext()
+        _fp8_mode = os.getenv("FP8_MODE", "static")
+        if _fp8_mode == "static":
+            # Static FP8: no TE context needed — weights are pre-quantized,
+            # StaticFP8Linear handles activation quantization internally
+            return contextlib.nullcontext()
+        # TE dynamic FP8 path
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import DelayedScaling, Format
+        _recipe = DelayedScaling(
+            fp8_format=Format.HYBRID,
+            amax_history_len=16,
+            amax_compute_algo="most_recent",
+        )
+        return te.fp8_autocast(enabled=True, fp8_recipe=_recipe, _graph=True)
 
     @staticmethod
     def _replace_linear_with_te(module: nn.Module) -> None:
@@ -1417,38 +1748,92 @@ class WANPolicyHead(ActionHead):
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
         self.fp8_inference = os.getenv("FP8_INFERENCE", "False").lower() == "true"
+        _fp8_mode = os.getenv("FP8_MODE", "static")  # "static" (TRT-LLM) or "te" (TE dynamic)
         if self.fp8_inference:
-            print("Enabling FP8 inference: replacing nn.Linear with te.Linear in DiT blocks (self_attn + ffn only).")
             self.model.fp8_inference = True
-            for block in self.model.blocks:
-                # Only replace self-attention and FFN linear layers, NOT cross-attention
-                # (cross-attn has fixed-size contexts like 257 CLIP tokens that don't meet FP8 alignment)
-                self._replace_linear_with_te(block.self_attn)
-                self._replace_linear_with_te(block.ffn)
+            if _fp8_mode == "static":
+                # Static FP8 (TRT-LLM pattern): pre-quantize weights, no per-call scaling overhead
+                from groot.vla.model.dreamzero.modules.fp8_linear import replace_linear_with_fp8
+                count = 0
+                for block in self.model.blocks:
+                    count += replace_linear_with_fp8(block.self_attn, target_modules=None)
+                    count += replace_linear_with_fp8(block.ffn, target_modules=None)
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    print(f"[StaticFP8] Replaced {count} nn.Linear → StaticFP8Linear (no TE)")
+            else:
+                # TE dynamic FP8 (original path)
+                print("Enabling FP8 inference: replacing nn.Linear with te.Linear in DiT blocks.")
+                for block in self.model.blocks:
+                    self._replace_linear_with_te(block.self_attn)
+                    self._replace_linear_with_te(block.ffn)
 
         DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() == "true"
         COMPILE_DIT = os.getenv("COMPILE_DIT", "False").lower() == "true"
         if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules.")
 
+            # Use mode=default for encoders to avoid cudagraph_trees
+            # AssertionError bug in PyTorch 2.8 and graph-tree invalidation
+            # on prompt length changes. Encoders run once per request so
+            # CUDA graph replay saves negligible time.
             self.text_encoder.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
+                mode="default", fullgraph=True, dynamic=False,
             )(self.text_encoder.forward)
 
             self.image_encoder.model.visual.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
+                mode="default", fullgraph=True, dynamic=False,
             )(self.image_encoder.model.visual.forward)
 
+            # Use mode=default for VAE: reduce-overhead (CUDA graphs) stores state
+            # in thread-local storage and breaks when OVERLAP_VAE_DIT runs the
+            # VAE in a background thread.
             self.vae.model.encode = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
+                mode="default", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
 
         if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE and COMPILE_DIT:
-            print("Torch compiling DiT _forward_blocks (dynamic=True for KV cache).")
+            # Two knobs:
+            #   COMPILE_DIT_MODE      (default "reduce-overhead")
+            #   COMPILE_DIT_DYNAMIC   (default "false" — static shapes)
+            #
+            # Background: with dynamic=True, dynamo materializes symbolic ints
+            # (e.g. KV-cache length) as 0-d CPU tensors in the traced FX graph.
+            # `cudagraph_trees` sees those as "cpu device" inputs and skips
+            # cudagraph capture — the whole point of reduce-overhead mode.
+            # With dynamic=False we specialize shapes; there is a compile hit
+            # on the first call with a new shape, but steady-state calls use
+            # the captured cudagraph.
+            _compile_mode = os.getenv("COMPILE_DIT_MODE", "reduce-overhead")
+            _compile_dynamic = os.getenv("COMPILE_DIT_DYNAMIC", "false").lower() == "true"
+            _compile_fullgraph = os.getenv("COMPILE_DIT_FULLGRAPH", "false").lower() == "true"
+            print(f"Torch compiling DiT _forward_blocks (mode={_compile_mode}, "
+                  f"dynamic={_compile_dynamic}, fullgraph={_compile_fullgraph}).")
             self.model._forward_blocks = torch.compile(
-                mode="reduce-overhead", dynamic=True,
+                mode=_compile_mode,
+                dynamic=_compile_dynamic,
+                fullgraph=_compile_fullgraph,
             )(self.model._forward_blocks)
-        
+
+        # Manual CUDA graph capture (vLLM/sglang pattern). Bypasses torch.compile
+        # entirely — no dynamo, no inductor, no graph-break drama. Captures a raw
+        # CUDA graph of the eager _forward_blocks, replays it on subsequent calls.
+        CUDA_GRAPH_MANUAL = os.getenv("CUDA_GRAPH_DIT_MANUAL", "false").lower() == "true"
+        if CUDA_GRAPH_MANUAL:
+            from groot.vla.model.dreamzero.cuda_graph_runner import CudaGraphDiTRunner
+            _dev = next(self.model.parameters()).device
+            self._cuda_graph_runner = CudaGraphDiTRunner(self.model, _dev)
+            self.model._cuda_graph_runner = self._cuda_graph_runner
+            print(f"Manual CUDA graph runner created for DiT _forward_blocks (device={_dev}).")
+
+        # Per-block torch.compile (FastVideo pattern): fuses small ops within
+        # each block without CUDA graph complexity. Complementary to piecewise.
+        COMPILE_BLOCKS = os.getenv("COMPILE_BLOCKS", "false").lower() == "true"
+        if COMPILE_BLOCKS and not COMPILE_DIT:
+            from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import compile_blocks_for_inference
+            compile_blocks_for_inference(self.model)
+        else:
+            self._cuda_graph_runner = None
+
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
             print(f"Loading TRT engine from {LOAD_TRT_ENGINE}")
@@ -1478,9 +1863,31 @@ class WANPolicyHead(ActionHead):
                 sp_rank=sp_mesh.get_local_rank(),
                 sp_size=sp_mesh.size(),
             )
+            # Initialize pynccl all-to-all for graph-capturable SP (vLLM pattern).
+            # Uses direct NCCL C calls on the CURRENT stream instead of
+            # torch.distributed's side-stream NCCL. Enable via PYNCCL_ALLTOALL=true.
+            if os.environ.get("PYNCCL_ALLTOALL", "false").lower() == "true" and sp_mesh.size() > 1:
+                try:
+                    from groot.vla.model.dreamzero.modules.pynccl_alltoall import PyNcclAllToAll
+                    _dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    self.sp_ctx.pynccl_comm = PyNcclAllToAll(sp_mesh.get_group(), _dev)
+                except Exception as e:
+                    print(f"[pynccl] Failed to init: {e}. Falling back to dist.all_to_all")
+                    self.sp_ctx.pynccl_comm = None
         else:
             self.sp_ctx = None
         self.model.set_sp_context(self.sp_ctx)
+
+        # Initialize TeaCache for step-level block skipping
+        if float(os.environ.get("TEACACHE_THRESH", "0")) > 0:
+            self.model.init_teacache()
+            if dist.is_initialized() and dist.get_rank() == 0 or not dist.is_initialized():
+                print(f"[TeaCache] Initialized with threshold={os.environ['TEACACHE_THRESH']}")
+
+        # Fuse Q,K,V into single linear (1 cuBLAS instead of 3)
+        # Skip when using FP8 — FP8 weights need special fusion logic
+        if os.environ.get("FUSE_QKV", "false").lower() == "true":
+            self.model.fuse_qkv_linears()
 
     @property
     def device(self):

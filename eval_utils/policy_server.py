@@ -101,6 +101,15 @@ class WebsocketPolicyServer:
                     action = self._policy.infer(obs)
                     to_return = packer.pack(action)
                 await websocket.send(to_return)
+                # Run deferred work on background thread so websocket.recv
+                # can overlap with GPU work (VAE+KV init for next chunk).
+                _run_deferred = getattr(self._policy, '_run_deferred_signal', None)
+                if _run_deferred is not None:
+                    import threading
+                    _def_thread = threading.Thread(target=_run_deferred, daemon=True)
+                    _def_thread.start()
+                    self._policy._run_deferred_signal = None
+                    self._policy._deferred_thread = _def_thread  # save for join
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
                 break

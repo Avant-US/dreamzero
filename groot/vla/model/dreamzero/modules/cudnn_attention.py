@@ -30,11 +30,15 @@ _TE_VER = tuple(int(x) for x in _te_version.split(".")[:2])
 try:
     # transformer_engine >= 2.8.0
     import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
-except ImportError:
-    # transformer_engine < 2.8.0
-    import transformer_engine.pytorch.dot_product_attention.utils as dpa_utils
-
-import transformer_engine_torch as tex
+    import transformer_engine_torch as tex
+except (ImportError, FileNotFoundError):
+    try:
+        # transformer_engine < 2.8.0
+        import transformer_engine.pytorch.dot_product_attention.utils as dpa_utils
+        import transformer_engine_torch as tex
+    except (ImportError, FileNotFoundError):
+        dpa_utils = None
+        tex = None
 from transformer_engine.pytorch.constants import (
     TE_DType,
 )

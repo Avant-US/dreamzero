@@ -18,12 +18,12 @@ _USE_POLAR_ROPE = (
 )
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
-    # preprocess
+    """Sinusoidal positional embedding. Only used as fallback — the main forward
+    path uses a pre-computed table (TRT-LLM pattern)."""
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
 
-    # calculation
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half, dtype=position.dtype, device=position.device).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
@@ -325,11 +325,14 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_k_img = WanRMSNorm(
             dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, crossattn_cache=None):
+    def forward(self, x, context, crossattn_cache=None, use_cache=False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
+            use_cache: If True, reuse K/V from previous call (same context).
+                       Compatible with torch.compile reduce-overhead — the
+                       bool triggers exactly 2 cached CUDA graphs.
         """
         context_img = context[:, :257]
         context = context[:, 257:]
@@ -337,24 +340,28 @@ class WanI2VCrossAttention(WanSelfAttention):
 
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
-        if crossattn_cache is not None: 
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
-            else: 
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"] 
-        else: 
-            # compute query, key, value   
+        # Text K/V (fused or separate)
+        _dim = self.num_heads * self.head_dim
+        if getattr(self, '_fused_kv', False):
+            kv = self.kv(context)  # [B, L, 2*dim]
+            k_flat, v_flat = kv.split(_dim, dim=-1)  # each [B, L, dim]
+            k = self.norm_k(k_flat).view(b, -1, n, d)
+            v = v_flat.view(b, -1, n, d)
+        else:
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
-        x = flash_attention(q, k, v, k_lens=None)
 
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
+        # CLIP K_img/V_img (fused or separate)
+        if getattr(self, '_fused_kv_img', False):
+            kv_img = self.kv_img(context_img)  # [B, L, 2*dim]
+            k_img_flat, v_img_flat = kv_img.split(_dim, dim=-1)
+            k_img = self.norm_k_img(k_img_flat).view(b, -1, n, d)
+            v_img = v_img_flat.view(b, -1, n, d)
+        else:
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
+
+        x = flash_attention(q, k, v, k_lens=None)
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
 
         # output
