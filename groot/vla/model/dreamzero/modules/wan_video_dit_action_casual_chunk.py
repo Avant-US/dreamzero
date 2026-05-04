@@ -1126,24 +1126,21 @@ class CausalWanSelfAttention(nn.Module):
 
             if _is_static:
                 # vLLM/TRT-LLM style: pre-allocated buffer, sequential writes,
-                # FA kernel masks via cu_seqlens_k. Tokens at positions
-                # 0..fill_level are valid, rest is unused buffer space.
-                # No torch.cat, no .item(), no clone, constant tensor shapes
-                # → CUDA graph safe from chunk 0.
+                # FA kernel masks via cu_seqlens_k.
                 _max = self.max_attention_size
                 _pos = self._fill_level_t
-                # Sequential write: append at current fill position.
-                # When buffer is full, oldest tokens are overwritten from pos 0
-                # (wrap around), maintaining temporal order for causal attention.
                 _write_pos = _pos % _max
                 _dst = (self._idx_base[:num_new_tokens] + _write_pos) % _max
                 cur_k[:, _dst] = roped_key
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
-                # Pass full buffer + valid length to FA kernel
-                new_k = cur_k
-                new_v = cur_v
-                _k_lens = torch.clamp(self._fill_level_t, max=_max).unsqueeze(0).to(torch.int32)
+                _filled = torch.clamp(self._fill_level_t, max=_max)
+                # Slice buffer to filled portion, then cat action tokens.
+                # This ensures action tokens are contiguous right after valid
+                # KV tokens — required for cu_seqlens_k masking in FA.
+                new_k = cur_k[:, :_filled.item()]
+                new_v = cur_v[:, :_filled.item()]
+                _k_lens = None  # k_lens=None since new_k is already the right size
             else:
                 # Dynamic path (original): cat + truncate
                 new_k = torch.cat([cur_k, roped_key], dim=1)

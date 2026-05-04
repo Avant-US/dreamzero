@@ -170,9 +170,9 @@ def flash_attention(
     zeros = torch.zeros([1], dtype=torch.int32, device=q.device)
     cu_seqlens_q = torch.cat([zeros, q_lens]).cumsum(0).to(torch.int32)
     cu_seqlens_k = torch.cat([zeros, k_lens]).cumsum(0).to(torch.int32)
-    # max_seqlen_k: pass buffer size (upper bound). FA accepts any value >=
-    # actual max. Avoids .item() GPU→CPU sync that breaks CUDA graphs.
-    _max_seqlen_k = lk
+    # max_seqlen_k: must match the actual max key length for correct tiling.
+    # Use k_lens.max() when available (static KV buffer), else buffer size.
+    _max_seqlen_k = int(k_lens.max().item())
 
     # apply attention
     if version == 3 and FLASH_ATTN_3_AVAILABLE:
