@@ -1127,18 +1127,18 @@ class CausalWanSelfAttention(nn.Module):
             if _is_static:
                 # Circular KV buffer with tensor indexing — eliminates ALL
                 # Python-int state that triggers dynamo guards / recompiles.
-                # Unfilled K slots are initialized to _KV_SENTINEL (-1e4) so
-                # Q@K produces very large negative scores → softmax ≈ 0,
-                # effectively masking them WITHOUT changing tensor shapes.
-                # Constant shapes = full CUDA graph capture.
                 _max = self.max_attention_size
                 _pos = self._fill_level_t
                 _dst = (self._idx_base[:num_new_tokens] + _pos) % _max
                 cur_k[:, _dst] = roped_key
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
-                new_k = cur_k
-                new_v = cur_v
+                # Slice to filled portion so attention doesn't see zero-padded
+                # slots. Once the buffer is full (_filled == _max), this is a
+                # no-op slice and CUDA graphs capture a single fixed shape.
+                _filled = min(self._fill_level_t.item(), _max)
+                new_k = cur_k[:, :_filled]
+                new_v = cur_v[:, :_filled]
             else:
                 # Dynamic path (original): cat + truncate
                 new_k = torch.cat([cur_k, roped_key], dim=1)
@@ -1982,10 +1982,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             _sp_orig_len = 0
 
         updated_kv_caches: list[torch.Tensor] = []
-        print(f'[FWD] sp_active={sp_active} x.shape={x.shape} entering blocks', flush=True)
         for block_index, block in enumerate(self.blocks):
-            if block_index == 0 or block_index == 1:
-                print(f'[FWD] block {block_index}/{len(self.blocks)} x.shape={x.shape}', flush=True)
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
@@ -2000,7 +1997,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             updated_kv_caches.append(updated_kv_cache)
 
         # Sequence parallelism: gather x and e back to full sequence before output extraction
-        print(f'[FWD] all blocks done, sp_gather', flush=True)
+        # [FWD] debug prints removed — they cause graph breaks in reduce-overhead mode
         if sp_active:
             _gname = "sp_group"
             x = sp_gather_seq(x, dim=1, sp_size=self.sp_ctx.sp_size, sp_group_name=_gname, original_length=_sp_orig_len)

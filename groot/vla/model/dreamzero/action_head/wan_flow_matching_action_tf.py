@@ -533,23 +533,12 @@ class WANPolicyHead(ActionHead):
         else:
             seq_cap = 0
 
-        # Sentinel value for unfilled K slots in static KV cache.
-        # Q @ K_sentinel produces very large negative attention scores →
-        # softmax ≈ 0, effectively masking unfilled slots WITHOUT changing
-        # tensor shapes. Constant shapes enable full CUDA graph capture.
-        _KV_SENTINEL = -1e4
-
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
             t1 = torch.zeros([2, batch_size, seq_cap, effective_num_heads, head_dim], dtype=dtype, device=device)
             t2 = torch.zeros([2, batch_size, seq_cap, effective_num_heads, head_dim], dtype=dtype, device=device)
             if static_kv:
-                # Initialize K slots (index 0) with sentinel so unfilled
-                # positions produce near-zero attention weights. V slots
-                # (index 1) stay zero — multiplied by ~0 softmax weight.
-                t1[0].fill_(_KV_SENTINEL)
-                t2[0].fill_(_KV_SENTINEL)
                 torch._dynamo.mark_static_address(t1)
                 torch._dynamo.mark_static_address(t2)
             kv_cache1.append(t1)

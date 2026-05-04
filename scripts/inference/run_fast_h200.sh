@@ -32,9 +32,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/localssd/dreamzero/huggingface_checkpoints}"
 PORT="${PORT:-5000}"
 SP_SIZE="${SP_SIZE:-4}"
 NUM_GPUS="${NUM_GPUS:-8}"
-# 4 active steps out of 16 (matches typical TeaCache adaptive behavior).
-# Static mask avoids data-dependent graph breaks → full CUDA graph capture.
-NUM_DIT_STEPS="${NUM_DIT_STEPS:-4}"
+NUM_DIT_STEPS="${NUM_DIT_STEPS:-16}"
 FP8_INFERENCE="${FP8_INFERENCE:-false}"
 
 # --- Core optimizations ---
@@ -43,10 +41,8 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-TE}"        # Falls back to FA2 on conda
 DISABLE_TORCH_COMPILE="${DISABLE_TORCH_COMPILE:-false}"  # Compile encoders too
 OVERLAP_VAE_DIT="${OVERLAP_VAE_DIT:-true}"
 
-# --- Static KV cache: constant shapes enable full CUDA graph capture ---
-# K buffer initialized with sentinel (-1e4) so unfilled slots produce
-# near-zero attention weights. No .item() graph break needed.
-STATIC_KV_CACHE="${STATIC_KV_CACHE:-true}"
+# --- Dynamic KV cache (faster than static due to no .item() graph breaks) ---
+STATIC_KV_CACHE="${STATIC_KV_CACHE:-false}"
 KV_INIT_CACHE_THRESH="${KV_INIT_CACHE_THRESH:-0}"   # No KV init skip
 
 # --- Compile settings ---
@@ -57,9 +53,9 @@ COMPILE_WARMUP_CHUNKS="${COMPILE_WARMUP_CHUNKS:-2}"
 COMPILE_DIT_MODE="${COMPILE_DIT_MODE:-reduce-overhead}"
 
 # --- Other defaults ---
-# Static step mask (false) = no data-dependent graph breaks → full CUDA graph capture.
-# Dynamic (true) = adaptive TeaCache skipping, but breaks CUDA graphs every step.
-DYNAMIC_CACHE="${DYNAMIC_CACHE:-false}"
+# TeaCache (true) = adaptive step skipping. Graph breaks are outside the compiled
+# _forward_blocks, so they don't affect CUDA graph capture.
+DYNAMIC_CACHE="${DYNAMIC_CACHE:-true}"
 CUDA_GRAPH_DIT="${CUDA_GRAPH_DIT:-false}"
 LOAD_TRT_ENGINE="${LOAD_TRT_ENGINE:-}"
 
