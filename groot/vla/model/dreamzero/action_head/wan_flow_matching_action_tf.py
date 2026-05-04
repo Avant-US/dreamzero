@@ -214,7 +214,11 @@ class WANPolicyHead(ActionHead):
         num_dit_steps = 8
         if os.getenv("NUM_DIT_STEPS") is not None:
             num_dit_steps = int(os.getenv("NUM_DIT_STEPS"))
-        if num_dit_steps == 5:
+        if num_dit_steps == 4:
+            # 4 steps: matches typical TeaCache adaptive behavior.
+            # Steps 0, 5, 10, 15 (evenly spaced across the schedule).
+            self.dit_step_mask = [True, False, False, False, False, True, False, False, False, False, True, False, False, False, False, True]
+        elif num_dit_steps == 5:
             self.dit_step_mask = [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False]
         elif num_dit_steps == 6:
             self.dit_step_mask = [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True]
@@ -529,13 +533,23 @@ class WANPolicyHead(ActionHead):
         else:
             seq_cap = 0
 
+        # Sentinel value for unfilled K slots in static KV cache.
+        # Q @ K_sentinel produces very large negative attention scores →
+        # softmax ≈ 0, effectively masking unfilled slots WITHOUT changing
+        # tensor shapes. Constant shapes enable full CUDA graph capture.
+        _KV_SENTINEL = -1e4
+
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
             t1 = torch.zeros([2, batch_size, seq_cap, effective_num_heads, head_dim], dtype=dtype, device=device)
             t2 = torch.zeros([2, batch_size, seq_cap, effective_num_heads, head_dim], dtype=dtype, device=device)
             if static_kv:
-                # Tell dynamo this tensor's data_ptr is stable across calls.
+                # Initialize K slots (index 0) with sentinel so unfilled
+                # positions produce near-zero attention weights. V slots
+                # (index 1) stay zero — multiplied by ~0 softmax weight.
+                t1[0].fill_(_KV_SENTINEL)
+                t2[0].fill_(_KV_SENTINEL)
                 torch._dynamo.mark_static_address(t1)
                 torch._dynamo.mark_static_address(t2)
             kv_cache1.append(t1)
