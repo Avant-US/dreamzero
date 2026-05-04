@@ -8,6 +8,12 @@ from typing import Optional
 import os
 
 try:
+    import flashinfer as _flashinfer
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+
+try:
     import flash_attn_interface
 
     def is_hopper_gpu():
@@ -170,19 +176,32 @@ def flash_attention(
     zeros = torch.zeros([1], dtype=torch.int32, device=q.device)
     cu_seqlens_q = torch.cat([zeros, q_lens]).cumsum(0).to(torch.int32)
     cu_seqlens_k = torch.cat([zeros, k_lens]).cumsum(0).to(torch.int32)
-    # max_seqlen_k: upper bound on actual key length. FA uses cu_seqlens_k
-    # for the real loop bounds. Passing lk (buffer size) is safe — just
-    # wastes some shared memory but doesn't affect correctness.
-    # This avoids .item() GPU→CPU sync that breaks CUDA graphs.
-    _max_seqlen_k = lk
 
     # apply attention
-    if version == 3 and FLASH_ATTN_3_AVAILABLE:
-        # Note: dropout_p, window_size are not supported in FA3 now.
+    if FLASHINFER_AVAILABLE and os.environ.get("ATTENTION_KERNEL", "") == "flashinfer":
+        # FlashInfer ragged prefill: natively handles pre-allocated buffers
+        # with variable kv_len. No max_seqlen_k overhead — kernel only
+        # processes valid positions. Hopper (SM90) optimized.
+        _fi_wrapper = getattr(flash_attention, '_fi_wrapper', None)
+        if _fi_wrapper is None:
+            _workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+            _fi_wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(_workspace, 'NHD')
+            flash_attention._fi_wrapper = _fi_wrapper
+
+        _fi_wrapper.begin_forward(
+            cu_seqlens_q, cu_seqlens_k,
+            num_qo_heads=q.shape[1], num_kv_heads=k.shape[1],
+            head_dim_qk=q.shape[2],
+            q_data_type=q.dtype,
+            causal=causal,
+            sm_scale=softmax_scale,
+        )
+        x = _fi_wrapper.forward(q, k, v, causal=causal).unflatten(0, (b, lq))
+        _fi_wrapper.end_forward()
+    elif version == 3 and FLASH_ATTN_3_AVAILABLE:
+        _max_seqlen_k = lk
         out = flash_attn_interface.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
+            q=q, k=k, v=v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=lq,
@@ -190,13 +209,11 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)
-        # FA3 returns a plain tensor; older versions returned (tensor, lse) tuple
         x = (out[0] if isinstance(out, tuple) else out).unflatten(0, (b, lq))
     elif FLASH_ATTN_2_AVAILABLE:
+        _max_seqlen_k = lk
         x = flash_attn.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
+            q=q, k=k, v=v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=lq,

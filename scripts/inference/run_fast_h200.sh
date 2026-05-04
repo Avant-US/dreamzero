@@ -130,6 +130,8 @@ cmd_start() {
         PYNCCL_ALLTOALL="${PYNCCL_ALLTOALL}" \
         NUM_DIT_STEPS="${NUM_DIT_STEPS}" \
         ATTENTION_BACKEND="${ATTENTION_BACKEND}" \
+        ATTENTION_KERNEL="${ATTENTION_KERNEL:-flashinfer}" \
+        FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-/mnt/localssd/flashinfer_cache}" \
         FP8_INFERENCE="${FP8_INFERENCE}" \
         CUDA_VISIBLE_DEVICES="${CUDA_DEVS}" \
         NUM_GPUS="${NUM_GPUS}" \
