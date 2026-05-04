@@ -1133,8 +1133,12 @@ class CausalWanSelfAttention(nn.Module):
                 cur_k[:, _dst] = roped_key
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
-                new_k = cur_k
-                new_v = cur_v
+                # Slice to filled portion so attention doesn't see zero-padded
+                # slots. Once the buffer is full (_filled == _max), this is a
+                # no-op slice and CUDA graphs capture a single fixed shape.
+                _filled = min(self._fill_level_t.item(), _max)
+                new_k = cur_k[:, :_filled]
+                new_v = cur_v[:, :_filled]
             else:
                 # Dynamic path (original): cat + truncate
                 new_k = torch.cat([cur_k, roped_key], dim=1)
