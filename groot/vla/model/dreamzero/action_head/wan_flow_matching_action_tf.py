@@ -999,15 +999,8 @@ class WANPolicyHead(ActionHead):
                     if _static_kv:
                         # In static mode, the model already wrote into the
                         # preallocated buffer in-place. Nothing to copy.
-                        # Check if buffer is now full → set flag so compiled
-                        # fn skips .item() slice on future calls.
-                        if not getattr(self.model.blocks[0].self_attn, '_buffer_full', False):
-                            _max = self.model.blocks[0].self_attn.max_attention_size
-                            if self.model.blocks[0].self_attn._fill_level_t.item() >= _max:
-                                for blk in self.model.blocks:
-                                    blk.self_attn._buffer_full = True
-                                if self.ip_rank == 0:
-                                    print(f"[static_kv] Buffer full — enabling constant-shape CUDA graph path")
+                        # k_lens (fill_level) passed to FA kernel handles masking.
+                        pass
                     else:
                         for block_index, updated_kv_cache in enumerate(updated_kv_caches):
                             kv_cache[block_index] = updated_kv_cache.clone()

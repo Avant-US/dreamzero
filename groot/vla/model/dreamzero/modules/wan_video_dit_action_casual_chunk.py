@@ -1126,43 +1126,41 @@ class CausalWanSelfAttention(nn.Module):
 
             if _is_static:
                 # Circular KV buffer: in-place writes, no torch.cat, no clone.
+                # vLLM/TRT-LLM pattern: pass full buffer to attention kernel,
+                # let the kernel mask via cu_seqlens_k. No Python slicing,
+                # no .item(), constant tensor shapes → CUDA graph safe.
                 _max = self.max_attention_size
                 _pos = self._fill_level_t
                 _dst = (self._idx_base[:num_new_tokens] + _pos) % _max
                 cur_k[:, _dst] = roped_key
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
-
-                if getattr(self, '_buffer_full', False):
-                    # Buffer full: use entire buffer. No .item(), constant
-                    # shapes → full CUDA graph capture.
-                    new_k = cur_k
-                    new_v = cur_v
-                else:
-                    # Buffer filling: slice to filled portion so attention
-                    # doesn't see zero-padded slots. .item() causes graph
-                    # break but is only hit during the fill-up phase.
-                    _filled = min(self._fill_level_t.item(), _max)
-                    new_k = cur_k[:, :_filled]
-                    new_v = cur_v[:, :_filled]
+                # Full buffer passed to attention — kernel handles masking
+                new_k = cur_k
+                new_v = cur_v
+                # k_lens tells attention how many positions are valid
+                _k_lens = torch.clamp(self._fill_level_t, max=_max).unsqueeze(0).to(torch.int32)
             else:
                 # Dynamic path (original): cat + truncate
                 new_k = torch.cat([cur_k, roped_key], dim=1)
                 new_v = torch.cat([cur_v, v], dim=1)
                 new_k = new_k[:, -self.max_attention_size:]
                 new_v = new_v[:, -self.max_attention_size:]
+                _k_lens = None
 
             if action_register_length is not None:
                 x = self.attn(
                     torch.cat([roped_query, roped_action_query], dim=1),
                     torch.cat([new_k, roped_action_key], dim=1),
                     torch.cat([new_v, action_v], dim=1),
+                    k_lens=_k_lens,
                 )
             else:
                 x = self.attn(
                     roped_query,
                     new_k,
                     new_v,
+                    k_lens=_k_lens,
                 )
 
             if _is_static:

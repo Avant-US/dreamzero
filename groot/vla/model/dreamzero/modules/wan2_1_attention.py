@@ -150,8 +150,12 @@ def flash_attention(
         v = half(v.flatten(0, 1))
         k_lens = torch.tensor([lk] * b, dtype=torch.int32, device=k.device)
     else:
-        k = half(torch.cat([u[:v] for u, v in zip(k, k_lens)]))
-        v = half(torch.cat([u[:v] for u, v in zip(v, k_lens)]))
+        # vLLM/TRT-LLM pattern: pass the FULL buffer without slicing.
+        # flash_attn_varlen_func uses cu_seqlens_k to read only valid
+        # positions — the kernel handles masking, not Python.
+        # No .item(), no list comprehension, constant shapes → CUDA graph safe.
+        k = half(k.flatten(0, 1))
+        v = half(v.flatten(0, 1))
 
     q = q.to(v.dtype)
     k = k.to(v.dtype)
@@ -166,6 +170,9 @@ def flash_attention(
     zeros = torch.zeros([1], dtype=torch.int32, device=q.device)
     cu_seqlens_q = torch.cat([zeros, q_lens]).cumsum(0).to(torch.int32)
     cu_seqlens_k = torch.cat([zeros, k_lens]).cumsum(0).to(torch.int32)
+    # max_seqlen_k: pass buffer size (upper bound). FA accepts any value >=
+    # actual max. Avoids .item() GPU→CPU sync that breaks CUDA graphs.
+    _max_seqlen_k = lk
 
     # apply attention
     if version == 3 and FLASH_ATTN_3_AVAILABLE:
@@ -177,7 +184,7 @@ def flash_attention(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=lq,
-            max_seqlen_k=lk,
+            max_seqlen_k=_max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)
@@ -191,7 +198,7 @@ def flash_attention(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=lq,
-            max_seqlen_k=lk,
+            max_seqlen_k=_max_seqlen_k,
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
