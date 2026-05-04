@@ -1121,12 +1121,14 @@ class CausalWanSelfAttention(nn.Module):
             cur_k = updated_kv_cache[0]  # [B, cur_or_max, H, D]
             cur_v = updated_kv_cache[1]
 
-            # Check if this is a static (pre-allocated) cache
-            _is_static = cur_k.shape[1] == self.max_attention_size
+            # Check if this is a static (pre-allocated) cache.
+            # Buffer may be larger than max_attention_size (extra slots for action tokens).
+            _is_static = cur_k.shape[1] >= self.max_attention_size and cur_k.shape[1] > 0
 
             if _is_static:
-                # vLLM/TRT-LLM style: pre-allocated buffer, sequential writes,
-                # FA kernel masks via cu_seqlens_k.
+                # vLLM/TRT-LLM style: pre-allocated buffer, sequential in-place
+                # writes, FA kernel masks via cu_seqlens_k. No .item(), no
+                # torch.cat, no slice — constant shapes, CUDA graph safe.
                 _max = self.max_attention_size
                 _pos = self._fill_level_t
                 _write_pos = _pos % _max
@@ -1135,12 +1137,9 @@ class CausalWanSelfAttention(nn.Module):
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
                 _filled = torch.clamp(self._fill_level_t, max=_max)
-                # Slice buffer to filled portion, then cat action tokens.
-                # This ensures action tokens are contiguous right after valid
-                # KV tokens — required for cu_seqlens_k masking in FA.
-                new_k = cur_k[:, :_filled.item()]
-                new_v = cur_v[:, :_filled.item()]
-                _k_lens = None  # k_lens=None since new_k is already the right size
+                new_k = cur_k
+                new_v = cur_v
+                _k_lens = _filled.unsqueeze(0).to(torch.int32)
             else:
                 # Dynamic path (original): cat + truncate
                 new_k = torch.cat([cur_k, roped_key], dim=1)
@@ -1150,12 +1149,27 @@ class CausalWanSelfAttention(nn.Module):
                 _k_lens = None
 
             if action_register_length is not None:
-                x = self.attn(
-                    torch.cat([roped_query, roped_action_query], dim=1),
-                    torch.cat([new_k, roped_action_key], dim=1),
-                    torch.cat([new_v, action_v], dim=1),
-                    k_lens=_k_lens,
-                )
+                if _is_static:
+                    # Write action tokens right after valid KV tokens in buffer.
+                    # Buffer was pre-allocated with extra slots for action tokens.
+                    _fl = _filled  # tensor
+                    _act_idx = self._idx_base[:action_register_length] + _fl
+                    new_k[:, _act_idx] = roped_action_key
+                    new_v[:, _act_idx] = action_v
+                    _k_lens = (_filled + action_register_length).unsqueeze(0).to(torch.int32)
+                    x = self.attn(
+                        torch.cat([roped_query, roped_action_query], dim=1),
+                        new_k,
+                        new_v,
+                        k_lens=_k_lens,
+                    )
+                else:
+                    x = self.attn(
+                        torch.cat([roped_query, roped_action_query], dim=1),
+                        torch.cat([new_k, roped_action_key], dim=1),
+                        torch.cat([new_v, action_v], dim=1),
+                        k_lens=_k_lens,
+                    )
             else:
                 x = self.attn(
                     roped_query,

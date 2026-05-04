@@ -519,7 +519,11 @@ class WANPolicyHead(ActionHead):
             max_attn = int(
                 getattr(self.model.blocks[0].self_attn, "max_attention_size", 21 * frame_seqlen)
             )
-            seq_cap = max_attn
+            # Extra slots for action/state register tokens that get written
+            # into the buffer right after the valid KV tokens during inference.
+            action_register_len = getattr(self.model, "num_action_per_block", 24) + \
+                                  getattr(self.model, "num_state_per_block", 1)
+            seq_cap = max_attn + action_register_len
             if self.ip_rank == 0:
                 mb_per_cache = (
                     2 * batch_size * seq_cap * effective_num_heads * head_dim
