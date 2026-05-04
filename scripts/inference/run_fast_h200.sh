@@ -52,10 +52,9 @@ KV_INIT_CACHE_THRESH="${KV_INIT_CACHE_THRESH:-0}"   # No KV init skip
 # --- Compile settings ---
 PYNCCL_ALLTOALL="${PYNCCL_ALLTOALL:-${COMPILE_DIT}}"
 COMPILE_WARMUP_CHUNKS="${COMPILE_WARMUP_CHUNKS:-2}"
-# max-autotune: benchmarks cuBLAS algorithms + triton configs at compile time,
-# AND captures CUDA graphs. ~10-20% faster kernels vs reduce-overhead alone.
-# Tradeoff: first compile is much slower (minutes), but cached by inductor.
-COMPILE_DIT_MODE="${COMPILE_DIT_MODE:-max-autotune}"
+# reduce-overhead: CUDA graph capture for kernel replay.
+# max-autotune would add kernel benchmarking but hits PyTorch 2.8 tiling bug.
+COMPILE_DIT_MODE="${COMPILE_DIT_MODE:-reduce-overhead}"
 
 # --- Other defaults ---
 # Static step mask (false) = no data-dependent graph breaks → full CUDA graph capture.
@@ -139,10 +138,9 @@ cmd_start() {
         SP_SIZE="${SP_SIZE}" \
         COMPILE_DIT_MODE="${COMPILE_DIT_MODE}" \
         COMPILE_DIT_FULLGRAPH="${COMPILE_DIT_FULLGRAPH:-false}" \
-        TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/mnt/localssd/torchinductor_cache}" \
+        TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/mnt/localssd/torchinductor_cache_v4}" \
         TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-4}" \
-        TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS="${TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS:-TRITON,ATen}" \
-        TORCHINDUCTOR_COORDINATE_DESCENT_TUNING="${TORCHINDUCTOR_COORDINATE_DESCENT_TUNING:-1}" \
+        TORCHINDUCTOR_COALESCE_TILING_ANALYSIS="${TORCHINDUCTOR_COALESCE_TILING_ANALYSIS:-0}" \
         KV_INIT_CACHE_THRESH="${KV_INIT_CACHE_THRESH}" \
         OVERLAP_VAE_DIT="${OVERLAP_VAE_DIT}" \
         COMPILE_WARMUP_CHUNKS="${COMPILE_WARMUP_CHUNKS}" \
