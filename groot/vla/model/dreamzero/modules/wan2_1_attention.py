@@ -13,6 +13,17 @@ try:
 except ImportError:
     FLASHINFER_AVAILABLE = False
 
+# Pre-allocated FlashInfer workspace — must be created outside torch.compile
+# because FlashInfer uses pin_memory which inductor doesn't support.
+_FLASHINFER_WRAPPERS: dict = {}
+
+def _get_flashinfer_wrapper(device: torch.device):
+    key = str(device)
+    if key not in _FLASHINFER_WRAPPERS:
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        _FLASHINFER_WRAPPERS[key] = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, 'NHD')
+    return _FLASHINFER_WRAPPERS[key]
+
 try:
     import flash_attn_interface
 
@@ -180,15 +191,11 @@ def flash_attention(
     # apply attention
     if FLASHINFER_AVAILABLE and os.environ.get("ATTENTION_KERNEL", "") == "flashinfer":
         # FlashInfer ragged prefill: natively handles pre-allocated buffers
-        # with variable kv_len. No max_seqlen_k overhead — kernel only
-        # processes valid positions. Hopper (SM90) optimized.
-        _fi_wrapper = getattr(flash_attention, '_fi_wrapper', None)
-        if _fi_wrapper is None:
-            _workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-            _fi_wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(_workspace, 'NHD')
-            flash_attention._fi_wrapper = _fi_wrapper
-
-        _fi_wrapper.begin_forward(
+        # with variable kv_len. No max_seqlen_k overhead.
+        # begin_forward/end_forward wrapped with compiler.disable since
+        # FlashInfer's plan step uses pin_memory (unsupported by inductor).
+        _fi_wrapper = _get_flashinfer_wrapper(q.device)
+        torch.compiler.disable(_fi_wrapper.begin_forward)(
             cu_seqlens_q, cu_seqlens_k,
             num_qo_heads=q.shape[1], num_kv_heads=k.shape[1],
             head_dim_qk=q.shape[2],
@@ -197,7 +204,7 @@ def flash_attention(
             sm_scale=softmax_scale,
         )
         x = _fi_wrapper.forward(q, k, v, causal=causal).unflatten(0, (b, lq))
-        _fi_wrapper.end_forward()
+        torch.compiler.disable(_fi_wrapper.end_forward)()
     elif version == 3 and FLASH_ATTN_3_AVAILABLE:
         _max_seqlen_k = lk
         out = flash_attn_interface.flash_attn_varlen_func(
