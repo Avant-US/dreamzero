@@ -1377,19 +1377,30 @@ class WANPolicyHead(ActionHead):
             else:
                 y = self.ys[:, :, -self.num_frame_per_block:]
 
-            # --- Optimization A+D: Skip KV init, reuse from previous diffusion ---
-            # The main diffusion loop already fills the KV cache with context
-            # from each chunk. On subsequent chunks, the previous cache provides
-            # sufficient reference conditioning without a separate forward pass.
-            # KV_INIT_CACHE_THRESH > 0 enables this: always skip if previous
-            # cache exists (the diffusion step keeps it warm).
+            # --- Adaptive KV init skip based on latent similarity ---
+            # When KV_INIT_CACHE_THRESH > 0, compare current VAE latents with
+            # previous chunk's. If cosine similarity > threshold, the scene
+            # hasn't changed much → skip KV init (reuse warm cache from previous
+            # diffusion). If scene changed significantly → run KV init to refresh.
+            # KV_INIT_CACHE_THRESH=0: never skip. KV_INIT_CACHE_THRESH=1: always skip.
             _skip_kv_init = False
             _kv_cache_thresh = float(os.environ.get("KV_INIT_CACHE_THRESH", "0"))
             if _kv_cache_thresh > 0:
-                # Skip if we have a warm KV cache from the previous chunk's diffusion
                 _has_warm_cache = getattr(self, "_kv_cache_warm", False)
-                if _has_warm_cache:
+                _prev_latents = getattr(self, "_prev_ref_latents", None)
+                if _has_warm_cache and _prev_latents is not None and _kv_cache_thresh < 1.0:
+                    # Compare current vs previous latents
+                    _sim = torch.nn.functional.cosine_similarity(
+                        current_ref_latents.flatten().unsqueeze(0).float(),
+                        _prev_latents.flatten().unsqueeze(0).float(),
+                    ).item()
+                    _skip_kv_init = _sim > _kv_cache_thresh
+                    if self.ip_rank == 0:
+                        print(f"[KV skip] sim={_sim:.4f} thresh={_kv_cache_thresh} → {'SKIP' if _skip_kv_init else 'RUN'}")
+                elif _has_warm_cache and _kv_cache_thresh >= 1.0:
+                    # thresh=1.0: always skip (original behavior)
                     _skip_kv_init = True
+            self._prev_ref_latents = current_ref_latents.detach()
 
             if not _skip_kv_init:
                 self._run_diffusion_steps(
