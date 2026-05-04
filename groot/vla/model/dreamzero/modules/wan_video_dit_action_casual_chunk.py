@@ -1125,20 +1125,24 @@ class CausalWanSelfAttention(nn.Module):
             _is_static = cur_k.shape[1] == self.max_attention_size
 
             if _is_static:
-                # Circular KV buffer: in-place writes, no torch.cat, no clone.
-                # vLLM/TRT-LLM pattern: pass full buffer to attention kernel,
-                # let the kernel mask via cu_seqlens_k. No Python slicing,
-                # no .item(), constant tensor shapes → CUDA graph safe.
+                # vLLM/TRT-LLM style: pre-allocated buffer, sequential writes,
+                # FA kernel masks via cu_seqlens_k. Tokens at positions
+                # 0..fill_level are valid, rest is unused buffer space.
+                # No torch.cat, no .item(), no clone, constant tensor shapes
+                # → CUDA graph safe from chunk 0.
                 _max = self.max_attention_size
                 _pos = self._fill_level_t
-                _dst = (self._idx_base[:num_new_tokens] + _pos) % _max
+                # Sequential write: append at current fill position.
+                # When buffer is full, oldest tokens are overwritten from pos 0
+                # (wrap around), maintaining temporal order for causal attention.
+                _write_pos = _pos % _max
+                _dst = (self._idx_base[:num_new_tokens] + _write_pos) % _max
                 cur_k[:, _dst] = roped_key
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
-                # Full buffer passed to attention — kernel handles masking
+                # Pass full buffer + valid length to FA kernel
                 new_k = cur_k
                 new_v = cur_v
-                # k_lens tells attention how many positions are valid
                 _k_lens = torch.clamp(self._fill_level_t, max=_max).unsqueeze(0).to(torch.int32)
             else:
                 # Dynamic path (original): cat + truncate
