@@ -41,8 +41,10 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-TE}"        # Falls back to FA2 on conda
 DISABLE_TORCH_COMPILE="${DISABLE_TORCH_COMPILE:-false}"  # Compile encoders too
 OVERLAP_VAE_DIT="${OVERLAP_VAE_DIT:-true}"
 
-# --- Dynamic KV cache (faster than static due to no .item() graph breaks) ---
-STATIC_KV_CACHE="${STATIC_KV_CACHE:-false}"
+# --- Static KV cache: in-place writes (no torch.cat/clone), constant shapes
+# after buffer fills up → full CUDA graph capture. .item() slice only during
+# fill-up phase (~11 chunks), then _buffer_full flag bypasses it.
+STATIC_KV_CACHE="${STATIC_KV_CACHE:-true}"
 KV_INIT_CACHE_THRESH="${KV_INIT_CACHE_THRESH:-0}"   # No KV init skip
 
 # --- Compile settings ---

@@ -1125,20 +1125,26 @@ class CausalWanSelfAttention(nn.Module):
             _is_static = cur_k.shape[1] == self.max_attention_size
 
             if _is_static:
-                # Circular KV buffer with tensor indexing — eliminates ALL
-                # Python-int state that triggers dynamo guards / recompiles.
+                # Circular KV buffer: in-place writes, no torch.cat, no clone.
                 _max = self.max_attention_size
                 _pos = self._fill_level_t
                 _dst = (self._idx_base[:num_new_tokens] + _pos) % _max
                 cur_k[:, _dst] = roped_key
                 cur_v[:, _dst] = v
                 self._fill_level_t.add_(num_new_tokens)
-                # Slice to filled portion so attention doesn't see zero-padded
-                # slots. Once the buffer is full (_filled == _max), this is a
-                # no-op slice and CUDA graphs capture a single fixed shape.
-                _filled = min(self._fill_level_t.item(), _max)
-                new_k = cur_k[:, :_filled]
-                new_v = cur_v[:, :_filled]
+
+                if getattr(self, '_buffer_full', False):
+                    # Buffer full: use entire buffer. No .item(), constant
+                    # shapes → full CUDA graph capture.
+                    new_k = cur_k
+                    new_v = cur_v
+                else:
+                    # Buffer filling: slice to filled portion so attention
+                    # doesn't see zero-padded slots. .item() causes graph
+                    # break but is only hit during the fill-up phase.
+                    _filled = min(self._fill_level_t.item(), _max)
+                    new_k = cur_k[:, :_filled]
+                    new_v = cur_v[:, :_filled]
             else:
                 # Dynamic path (original): cat + truncate
                 new_k = torch.cat([cur_k, roped_key], dim=1)
