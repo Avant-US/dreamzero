@@ -41,10 +41,10 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-TE}"        # Falls back to FA2 on conda
 DISABLE_TORCH_COMPILE="${DISABLE_TORCH_COMPILE:-false}"  # Compile encoders too
 OVERLAP_VAE_DIT="${OVERLAP_VAE_DIT:-true}"
 
-# --- Static KV cache: in-place writes (no torch.cat/clone), constant shapes
-# after buffer fills up → full CUDA graph capture. .item() slice only during
-# fill-up phase (~11 chunks), then _buffer_full flag bypasses it.
-STATIC_KV_CACHE="${STATIC_KV_CACHE:-true}"
+# --- Dynamic KV cache: best speed with torch.compile reduce-overhead.
+# Static KV (vLLM-style) is architecturally cleaner but same speed due
+# to max_seqlen_k overhead in FA2 + cudagraph_trees limitations.
+STATIC_KV_CACHE="${STATIC_KV_CACHE:-false}"
 KV_INIT_CACHE_THRESH="${KV_INIT_CACHE_THRESH:-0}"   # No KV init skip
 
 # --- Compile settings ---
@@ -130,8 +130,7 @@ cmd_start() {
         PYNCCL_ALLTOALL="${PYNCCL_ALLTOALL}" \
         NUM_DIT_STEPS="${NUM_DIT_STEPS}" \
         ATTENTION_BACKEND="${ATTENTION_BACKEND}" \
-        ATTENTION_KERNEL="${ATTENTION_KERNEL:-flashinfer}" \
-        FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-/mnt/localssd/flashinfer_cache}" \
+        ATTENTION_KERNEL="${ATTENTION_KERNEL:-}" \
         FP8_INFERENCE="${FP8_INFERENCE}" \
         CUDA_VISIBLE_DEVICES="${CUDA_DEVS}" \
         NUM_GPUS="${NUM_GPUS}" \
