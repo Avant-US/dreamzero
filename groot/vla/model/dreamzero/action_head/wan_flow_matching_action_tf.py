@@ -19,6 +19,12 @@ from huggingface_hub import hf_hub_download
 
 from groot.vla.model.dreamzero import perf_profile as _perf_profile
 
+try:
+    import flashinfer as _flashinfer
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -970,16 +976,38 @@ class WANPolicyHead(ActionHead):
                         for blk in self.model.blocks
                     ]
 
-                # Pre-compute max_seqlen_k outside the compiled region.
-                # .item() here is OK — it's in Python, not inside torch.compile.
-                # This gives FA the correct tile count instead of buffer_size.
-                if _static_kv:
+                # FlashInfer plan() — called OUTSIDE the compiled region.
+                # plan() does workspace allocation (pin_memory), .item() etc.
+                # Only run() goes inside the compiled _forward_blocks.
+                if _static_kv and FLASHINFER_AVAILABLE and os.environ.get("ATTENTION_KERNEL", "") == "flashinfer":
                     _fl = self.model.blocks[0].self_attn._fill_level_t.item()
                     _max = self.model.blocks[0].self_attn.max_attention_size
                     _action_reg = getattr(self.model, "num_action_per_block", 24) + \
                                   getattr(self.model, "num_state_per_block", 1)
-                    # After this forward, fill_level will be _fl + num_new_tokens.
-                    # max_seqlen_k = min(_fl + seq_len + _action_reg, _max + _action_reg)
+                    _kv_len = min(_fl + seq_len + _action_reg, _max + _action_reg)
+                    _q_len = seq_len + _action_reg if action is not None else seq_len
+
+                    for blk in self.model.blocks:
+                        _sa = blk.self_attn
+                        if not hasattr(_sa, '_fi_wrapper'):
+                            _ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=noisy_input.device)
+                            _sa._fi_wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(_ws, 'NHD')
+                        _q_indptr = torch.tensor([0, _q_len], dtype=torch.int32, device=noisy_input.device)
+                        _kv_indptr = torch.tensor([0, _kv_len], dtype=torch.int32, device=noisy_input.device)
+                        _n_heads = _sa.num_heads // (self.sp_ctx.sp_size if self.sp_ctx else 1)
+                        _sa._fi_wrapper.begin_forward(
+                            _q_indptr, _kv_indptr,
+                            num_qo_heads=_n_heads, num_kv_heads=_n_heads,
+                            head_dim_qk=_sa.head_dim,
+                            q_data_type=torch.bfloat16,
+                            causal=False,
+                        )
+                elif _static_kv:
+                    # FA2 path: pre-compute max_seqlen_k hint
+                    _fl = self.model.blocks[0].self_attn._fill_level_t.item()
+                    _max = self.model.blocks[0].self_attn.max_attention_size
+                    _action_reg = getattr(self.model, "num_action_per_block", 24) + \
+                                  getattr(self.model, "num_state_per_block", 1)
                     _max_kv = min(_fl + seq_len + _action_reg, _max + _action_reg)
                     for blk in self.model.blocks:
                         blk.self_attn._max_seqlen_k_hint = int(_max_kv)
@@ -1003,6 +1031,13 @@ class WANPolicyHead(ActionHead):
                     )
 
                 print(f'[DBG r={self.ip_rank}] model.forward DONE', flush=True)
+
+                # FlashInfer end_forward — cleanup after run()
+                if _static_kv and FLASHINFER_AVAILABLE and os.environ.get("ATTENTION_KERNEL", "") == "flashinfer":
+                    for blk in self.model.blocks:
+                        if hasattr(blk.self_attn, '_fi_wrapper'):
+                            blk.self_attn._fi_wrapper.end_forward()
+
                 if _static_kv:
                     self.model._current_static_kv_group = None
 

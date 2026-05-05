@@ -1156,15 +1156,24 @@ class CausalWanSelfAttention(nn.Module):
                     new_k[:, _act_idx] = roped_action_key
                     new_v[:, _act_idx] = action_v
                     _k_lens = (_filled + action_register_length).unsqueeze(0).to(torch.int32)
-                    # max_seqlen_k_hint computed outside compiled region (no .item() here)
-                    _msk_hint = getattr(self, '_max_seqlen_k_hint', None)
-                    x = self.attn(
-                        torch.cat([roped_query, roped_action_query], dim=1),
-                        new_k,
-                        new_v,
-                        k_lens=_k_lens,
-                        max_seqlen_k_override=_msk_hint,
-                    )
+
+                    _fi = getattr(self, '_fi_wrapper', None)
+                    if _fi is not None:
+                        # FlashInfer run() — plan() was called outside compiled region
+                        _q_fi = torch.cat([roped_query, roped_action_query], dim=1).flatten(0, 1)
+                        _k_fi = new_k.flatten(0, 1)
+                        _v_fi = new_v.flatten(0, 1)
+                        x = _fi.run(_q_fi, _k_fi, _v_fi, causal=False)
+                        x = x.unflatten(0, (roped_query.shape[0], -1))
+                    else:
+                        _msk_hint = getattr(self, '_max_seqlen_k_hint', None)
+                        x = self.attn(
+                            torch.cat([roped_query, roped_action_query], dim=1),
+                            new_k,
+                            new_v,
+                            k_lens=_k_lens,
+                            max_seqlen_k_override=_msk_hint,
+                        )
                 else:
                     x = self.attn(
                         torch.cat([roped_query, roped_action_query], dim=1),
@@ -1173,14 +1182,22 @@ class CausalWanSelfAttention(nn.Module):
                         k_lens=_k_lens,
                     )
             else:
-                _msk_hint = getattr(self, '_max_seqlen_k_hint', None) if _is_static else None
-                x = self.attn(
-                    roped_query,
-                    new_k,
-                    new_v,
-                    k_lens=_k_lens,
-                    max_seqlen_k_override=_msk_hint,
-                )
+                _fi = getattr(self, '_fi_wrapper', None) if _is_static else None
+                if _fi is not None:
+                    _q_fi = roped_query.flatten(0, 1)
+                    _k_fi = new_k.flatten(0, 1)
+                    _v_fi = new_v.flatten(0, 1)
+                    x = _fi.run(_q_fi, _k_fi, _v_fi, causal=False)
+                    x = x.unflatten(0, (roped_query.shape[0], -1))
+                else:
+                    _msk_hint = getattr(self, '_max_seqlen_k_hint', None) if _is_static else None
+                    x = self.attn(
+                        roped_query,
+                        new_k,
+                        new_v,
+                        k_lens=_k_lens,
+                        max_seqlen_k_override=_msk_hint,
+                    )
 
             if _is_static:
                 updated_kv_cache = kv_cache  # same buffer, modified in-place
