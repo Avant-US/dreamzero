@@ -991,18 +991,27 @@ class WANPolicyHead(ActionHead):
                         _sa = blk.self_attn
                         if not hasattr(_sa, '_fi_wrapper'):
                             _ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=noisy_input.device)
-                            # use_cuda_graph=True: pre-allocates internal buffers.
-                            # qo/kv_indptr_buf must accommodate max token counts.
-                            _max_q = seq_len + _action_reg  # max query tokens
-                            _max_kv_cap = _max + _action_reg  # max KV tokens
-                            _qo_buf = torch.zeros(_max_q + 1, dtype=torch.int32, device=noisy_input.device)
-                            _kv_buf = torch.zeros(_max_kv_cap + 1, dtype=torch.int32, device=noisy_input.device)
-                            _sa._fi_wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                            _qo_buf = torch.zeros(2, dtype=torch.int32, device=noisy_input.device)
+                            _kv_buf = torch.zeros(2, dtype=torch.int32, device=noisy_input.device)
+                            _fi = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                                 _ws, 'NHD',
                                 use_cuda_graph=True,
                                 qo_indptr_buf=_qo_buf,
                                 kv_indptr_buf=_kv_buf,
                             )
+                            # Dummy plan with max sizes so FlashInfer pre-allocates
+                            # internal buffers large enough for any future call.
+                            _max_q_total = seq_len + _action_reg
+                            _max_kv_total = _max + _action_reg
+                            _fi.begin_forward(
+                                torch.tensor([0, _max_q_total], dtype=torch.int32, device=noisy_input.device),
+                                torch.tensor([0, _max_kv_total], dtype=torch.int32, device=noisy_input.device),
+                                num_qo_heads=_n_heads, num_kv_heads=_n_heads,
+                                head_dim_qk=_sa.head_dim,
+                                q_data_type=torch.bfloat16, causal=False,
+                            )
+                            _fi.end_forward()
+                            _sa._fi_wrapper = _fi
                         _q_indptr = torch.tensor([0, _q_len], dtype=torch.int32, device=noisy_input.device)
                         _kv_indptr = torch.tensor([0, _kv_len], dtype=torch.int32, device=noisy_input.device)
                         _n_heads = _sa.num_heads // (self.sp_ctx.sp_size if self.sp_ctx else 1)
