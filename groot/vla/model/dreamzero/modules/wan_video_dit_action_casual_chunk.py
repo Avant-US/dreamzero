@@ -1151,17 +1151,19 @@ class CausalWanSelfAttention(nn.Module):
             if action_register_length is not None:
                 if _is_static:
                     # Write action tokens right after valid KV tokens in buffer.
-                    # Buffer was pre-allocated with extra slots for action tokens.
                     _fl = _filled  # tensor
                     _act_idx = self._idx_base[:action_register_length] + _fl
                     new_k[:, _act_idx] = roped_action_key
                     new_v[:, _act_idx] = action_v
                     _k_lens = (_filled + action_register_length).unsqueeze(0).to(torch.int32)
+                    # max_seqlen_k_hint computed outside compiled region (no .item() here)
+                    _msk_hint = getattr(self, '_max_seqlen_k_hint', None)
                     x = self.attn(
                         torch.cat([roped_query, roped_action_query], dim=1),
                         new_k,
                         new_v,
                         k_lens=_k_lens,
+                        max_seqlen_k_override=_msk_hint,
                     )
                 else:
                     x = self.attn(
@@ -1171,11 +1173,13 @@ class CausalWanSelfAttention(nn.Module):
                         k_lens=_k_lens,
                     )
             else:
+                _msk_hint = getattr(self, '_max_seqlen_k_hint', None) if _is_static else None
                 x = self.attn(
                     roped_query,
                     new_k,
                     new_v,
                     k_lens=_k_lens,
+                    max_seqlen_k_override=_msk_hint,
                 )
 
             if _is_static:

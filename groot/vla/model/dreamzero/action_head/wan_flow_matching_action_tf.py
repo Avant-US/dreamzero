@@ -970,6 +970,19 @@ class WANPolicyHead(ActionHead):
                         for blk in self.model.blocks
                     ]
 
+                # Pre-compute max_seqlen_k outside the compiled region.
+                # .item() here is OK — it's in Python, not inside torch.compile.
+                # This gives FA the correct tile count instead of buffer_size.
+                if _static_kv:
+                    _fl = self.model.blocks[0].self_attn._fill_level_t.item()
+                    _max = self.model.blocks[0].self_attn.max_attention_size
+                    _action_reg = getattr(self.model, "num_action_per_block", 24) + \
+                                  getattr(self.model, "num_state_per_block", 1)
+                    # After this forward, fill_level will be _fl + num_new_tokens.
+                    # max_seqlen_k = min(_fl + seq_len + _action_reg, _max + _action_reg)
+                    _max_kv = min(_fl + seq_len + _action_reg, _max + _action_reg)
+                    for blk in self.model.blocks:
+                        blk.self_attn._max_seqlen_k_hint = int(_max_kv)
                 print(f'[DBG r={self.ip_rank}] model.forward START (group={getattr(self.model, "_current_static_kv_group", "?")}, update_kv={kv_cache_metadata.get("update_kv_cache", "?")})', flush=True)
                 _fp8_ctx = self._get_fp8_context()
                 with _fp8_ctx:

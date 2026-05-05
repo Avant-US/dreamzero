@@ -102,6 +102,7 @@ def flash_attention(
     k_lens: Optional[torch.Tensor] = None,
     dropout_p: float = 0.,
     softmax_scale: Optional[float] = None,
+    max_seqlen_k_override: Optional[int] = None,
     q_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Optional[tuple[int, int]] = None,
@@ -187,26 +188,12 @@ def flash_attention(
     zeros = torch.zeros([1], dtype=torch.int32, device=q.device)
     cu_seqlens_q = torch.cat([zeros, q_lens]).cumsum(0).to(torch.int32)
     cu_seqlens_k = torch.cat([zeros, k_lens]).cumsum(0).to(torch.int32)
+    # Use caller-provided max_seqlen_k (computed outside compiled region
+    # via .item()) if available. Otherwise fall back to buffer size.
+    _max_seqlen_k = max_seqlen_k_override if max_seqlen_k_override is not None else lk
 
     # apply attention
-    if FLASHINFER_AVAILABLE and os.environ.get("ATTENTION_KERNEL", "") == "flashinfer":
-        # FlashInfer ragged prefill: natively handles pre-allocated buffers
-        # with variable kv_len. No max_seqlen_k overhead.
-        # begin_forward/end_forward wrapped with compiler.disable since
-        # FlashInfer's plan step uses pin_memory (unsupported by inductor).
-        _fi_wrapper = _get_flashinfer_wrapper(q.device)
-        torch.compiler.disable(_fi_wrapper.begin_forward)(
-            cu_seqlens_q, cu_seqlens_k,
-            num_qo_heads=q.shape[1], num_kv_heads=k.shape[1],
-            head_dim_qk=q.shape[2],
-            q_data_type=q.dtype,
-            causal=causal,
-            sm_scale=softmax_scale,
-        )
-        x = _fi_wrapper.forward(q, k, v, causal=causal).unflatten(0, (b, lq))
-        torch.compiler.disable(_fi_wrapper.end_forward)()
-    elif version == 3 and FLASH_ATTN_3_AVAILABLE:
-        _max_seqlen_k = lk
+    if version == 3 and FLASH_ATTN_3_AVAILABLE:
         out = flash_attn_interface.flash_attn_varlen_func(
             q=q, k=k, v=v,
             cu_seqlens_q=cu_seqlens_q,
@@ -357,6 +344,7 @@ class AttentionModule(torch.nn.Module):
             def _flash_attn_impl(
                 q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 q_lens: Optional[torch.Tensor], k_lens: Optional[torch.Tensor],
+                max_seqlen_k_override: Optional[int] = None,
             ) -> torch.Tensor:
                 return flash_attention(
                     q=q, k=k, v=v,
@@ -369,6 +357,7 @@ class AttentionModule(torch.nn.Module):
                     deterministic=deterministic,
                     dtype=dtype,
                     version=3 if backend == "FA3" else 2,
+                    max_seqlen_k_override=max_seqlen_k_override,
                 )
             self.attn_func = _flash_attn_impl
 
@@ -383,6 +372,7 @@ class AttentionModule(torch.nn.Module):
         q_lens: Optional[torch.Tensor] = None,
         k_lens: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        max_seqlen_k_override: Optional[int] = None,
     ):
         if (
             self.backend == "torch" or
@@ -397,4 +387,4 @@ class AttentionModule(torch.nn.Module):
         else:
             # Flash-attn path: no attn_mask support; caller must ensure static
             # shapes via cu_seqlens if desired (not implemented here).
-            return self.attn_func(q, k, v, q_lens, k_lens)  # type: ignore[call-arg]
+            return self.attn_func(q, k, v, q_lens, k_lens, max_seqlen_k_override=max_seqlen_k_override)  # type: ignore[call-arg]
