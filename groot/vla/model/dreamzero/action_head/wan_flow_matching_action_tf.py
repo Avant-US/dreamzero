@@ -987,8 +987,10 @@ class WANPolicyHead(ActionHead):
                     _kv_len = min(_fl + seq_len + _action_reg, _max + _action_reg)
                     _q_len = seq_len + _action_reg if action is not None else seq_len
 
+                    _sp_size = self.sp_ctx.sp_size if self.sp_ctx else 1
                     for blk in self.model.blocks:
                         _sa = blk.self_attn
+                        _n_heads = _sa.num_heads // _sp_size
                         if not hasattr(_sa, '_fi_wrapper'):
                             _ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=noisy_input.device)
                             _qo_buf = torch.zeros(2, dtype=torch.int32, device=noisy_input.device)
@@ -1014,7 +1016,6 @@ class WANPolicyHead(ActionHead):
                             _sa._fi_wrapper = _fi
                         _q_indptr = torch.tensor([0, _q_len], dtype=torch.int32, device=noisy_input.device)
                         _kv_indptr = torch.tensor([0, _kv_len], dtype=torch.int32, device=noisy_input.device)
-                        _n_heads = _sa.num_heads // (self.sp_ctx.sp_size if self.sp_ctx else 1)
                         _sa._fi_wrapper.begin_forward(
                             _q_indptr, _kv_indptr,
                             num_qo_heads=_n_heads, num_kv_heads=_n_heads,
