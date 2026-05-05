@@ -1605,14 +1605,19 @@ class WANPolicyHead(ActionHead):
                 end_diffusion_events[index].record()
 
             # Video: denoising step (uses rescaled schedule if decoupled)
-            noisy_input = sample_scheduler.step(
-                model_output=flow_pred.transpose(1, 2),
-                timestep=video_timestep,
-                sample=noisy_input,
-                step_index=index,
-                return_dict=False,
-            )[0]
-            
+            _is_last_step = (index == len(sample_scheduler.timesteps) - 1)
+            _action_only = os.environ.get("ACTION_ONLY", "false").lower() == "true"
+            if not (_action_only and _is_last_step):
+                # Skip video scheduler on last step in action-only mode —
+                # the video output is not used, saves one scheduler step + transpose
+                noisy_input = sample_scheduler.step(
+                    model_output=flow_pred.transpose(1, 2),
+                    timestep=video_timestep,
+                    sample=noisy_input,
+                    step_index=index,
+                    return_dict=False,
+                )[0]
+
             # Action: always fully denoises with standard schedule (1000->0)
             noisy_input_action = sample_scheduler_action.step(
                 model_output=flow_pred_cond_action,
@@ -1762,8 +1767,12 @@ class WANPolicyHead(ActionHead):
         _global_rank = dist.get_rank() if dist.is_initialized() else 0
         _perf_profile.maybe_stop_trace(_global_rank)
 
+        _action_only = os.environ.get("ACTION_ONLY", "false").lower() == "true"
+        if _action_only:
+            # Skip video transpose — large tensor op not needed for action-only
+            return BatchFeature(data={"action_pred": latents_action, "video_pred": output})
         return BatchFeature(data={"action_pred": latents_action, "video_pred": output.transpose(1, 2)})
-    
+
     def cache_predict_order1(self, current_timestep, timestep_1, f1, timestep_2, f2):
         h_curr = current_timestep - timestep_1
         h_past = timestep_1 - timestep_2

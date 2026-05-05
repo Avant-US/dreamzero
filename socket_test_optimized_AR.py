@@ -315,8 +315,9 @@ class ARDroidRoboarenaPolicy:
 
             self._run_deferred_signal = _run_deferred_signal
 
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
+        # Store video predictions for potential saving (skip in action-only mode)
+        if not os.environ.get("ACTION_ONLY", "false").lower() == "true":
+            self.video_across_time.append(video_pred)
         
         # Extract and convert action
         action_chunk_dict = result_batch.act
