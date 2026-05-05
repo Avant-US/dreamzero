@@ -1605,18 +1605,13 @@ class WANPolicyHead(ActionHead):
                 end_diffusion_events[index].record()
 
             # Video: denoising step (uses rescaled schedule if decoupled)
-            _is_last_step = (index == len(sample_scheduler.timesteps) - 1)
-            _action_only = os.environ.get("ACTION_ONLY", "false").lower() == "true"
-            if not (_action_only and _is_last_step):
-                # Skip video scheduler on last step in action-only mode —
-                # the video output is not used, saves one scheduler step + transpose
-                noisy_input = sample_scheduler.step(
-                    model_output=flow_pred.transpose(1, 2),
-                    timestep=video_timestep,
-                    sample=noisy_input,
-                    step_index=index,
-                    return_dict=False,
-                )[0]
+            noisy_input = sample_scheduler.step(
+                model_output=flow_pred.transpose(1, 2),
+                timestep=video_timestep,
+                sample=noisy_input,
+                step_index=index,
+                return_dict=False,
+            )[0]
 
             # Action: always fully denoises with standard schedule (1000->0)
             noisy_input_action = sample_scheduler_action.step(
