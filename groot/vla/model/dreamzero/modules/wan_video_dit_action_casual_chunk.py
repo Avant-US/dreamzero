@@ -1163,7 +1163,7 @@ class CausalWanSelfAttention(nn.Module):
                         _q_fi = torch.cat([roped_query, roped_action_query], dim=1).flatten(0, 1)
                         _k_fi = new_k.flatten(0, 1)
                         _v_fi = new_v.flatten(0, 1)
-                        x = _fi.run(_q_fi, _k_fi, _v_fi, causal=False)
+                        x = _fi.run(_q_fi, _k_fi, _v_fi)
                         x = x.unflatten(0, (roped_query.shape[0], -1))
                     else:
                         _msk_hint = getattr(self, '_max_seqlen_k_hint', None)
@@ -1187,7 +1187,7 @@ class CausalWanSelfAttention(nn.Module):
                     _q_fi = roped_query.flatten(0, 1)
                     _k_fi = new_k.flatten(0, 1)
                     _v_fi = new_v.flatten(0, 1)
-                    x = _fi.run(_q_fi, _k_fi, _v_fi, causal=False)
+                    x = _fi.run(_q_fi, _k_fi, _v_fi)
                     x = x.unflatten(0, (roped_query.shape[0], -1))
                 else:
                     _msk_hint = getattr(self, '_max_seqlen_k_hint', None) if _is_static else None

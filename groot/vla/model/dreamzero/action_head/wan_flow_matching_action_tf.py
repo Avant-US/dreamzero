@@ -991,7 +991,16 @@ class WANPolicyHead(ActionHead):
                         _sa = blk.self_attn
                         if not hasattr(_sa, '_fi_wrapper'):
                             _ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=noisy_input.device)
-                            _sa._fi_wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(_ws, 'NHD')
+                            # use_cuda_graph=True: pre-allocates indptr buffers so
+                            # begin_forward updates in-place → run() is graph-safe.
+                            _qo_buf = torch.zeros(2, dtype=torch.int32, device=noisy_input.device)
+                            _kv_buf = torch.zeros(2, dtype=torch.int32, device=noisy_input.device)
+                            _sa._fi_wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                                _ws, 'NHD',
+                                use_cuda_graph=True,
+                                qo_indptr_buf=_qo_buf,
+                                kv_indptr_buf=_kv_buf,
+                            )
                         _q_indptr = torch.tensor([0, _q_len], dtype=torch.int32, device=noisy_input.device)
                         _kv_indptr = torch.tensor([0, _kv_len], dtype=torch.int32, device=noisy_input.device)
                         _n_heads = _sa.num_heads // (self.sp_ctx.sp_size if self.sp_ctx else 1)
