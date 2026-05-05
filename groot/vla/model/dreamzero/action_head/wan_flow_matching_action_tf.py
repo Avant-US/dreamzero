@@ -1010,6 +1010,9 @@ class WANPolicyHead(ActionHead):
                             _max_seq = self.config.num_frame_per_block * self.model.frame_seqlen
                             _max_q_total = _max_seq // _sp_size + _action_reg
                             _max_kv_total = _max + _action_reg
+                            # Pre-compile FlashInfer kernels with dummy plan+run.
+                            # This triggers JIT compilation so future run() calls
+                            # produce real GPU work (capturable by CUDA graphs).
                             _fi.begin_forward(
                                 torch.tensor([0, _max_q_total], dtype=torch.int32, device=noisy_input.device),
                                 torch.tensor([0, _max_kv_total], dtype=torch.int32, device=noisy_input.device),
@@ -1017,7 +1020,13 @@ class WANPolicyHead(ActionHead):
                                 head_dim_qk=_sa.head_dim,
                                 q_data_type=torch.bfloat16, causal=False,
                             )
+                            # Dummy run() to trigger kernel JIT compilation
+                            _dummy_q = torch.zeros(_max_q_total, _n_heads, _sa.head_dim, device=noisy_input.device, dtype=torch.bfloat16)
+                            _dummy_k = torch.zeros(_max_kv_total, _n_heads, _sa.head_dim, device=noisy_input.device, dtype=torch.bfloat16)
+                            _dummy_v = torch.zeros(_max_kv_total, _n_heads, _sa.head_dim, device=noisy_input.device, dtype=torch.bfloat16)
+                            _fi.run(_dummy_q, _dummy_k, _dummy_v)
                             _fi.end_forward()
+                            del _dummy_q, _dummy_k, _dummy_v
                             _sa._fi_wrapper = _fi
                         _q_indptr = torch.tensor([0, _q_len], dtype=torch.int32, device=noisy_input.device)
                         _kv_indptr = torch.tensor([0, _kv_len], dtype=torch.int32, device=noisy_input.device)
