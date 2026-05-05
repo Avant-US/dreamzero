@@ -1006,7 +1006,9 @@ class WANPolicyHead(ActionHead):
                             )
                             # Dummy plan with max per-GPU sizes so FlashInfer
                             # pre-allocates internal buffers.
-                            _max_q_total = seq_len // _sp_size + _action_reg
+                            # Use num_frame_per_block * frame_seqlen (max possible)
+                            _max_seq = self.config.num_frame_per_block * self.model.frame_seqlen
+                            _max_q_total = _max_seq // _sp_size + _action_reg
                             _max_kv_total = _max + _action_reg
                             _fi.begin_forward(
                                 torch.tensor([0, _max_q_total], dtype=torch.int32, device=noisy_input.device),
