@@ -984,8 +984,11 @@ class WANPolicyHead(ActionHead):
                     _max = self.model.blocks[0].self_attn.max_attention_size
                     _action_reg = getattr(self.model, "num_action_per_block", 24) + \
                                   getattr(self.model, "num_state_per_block", 1)
-                    _kv_len = min(_fl + seq_len + _action_reg, _max + _action_reg)
-                    _q_len = seq_len + _action_reg if action is not None else seq_len
+                    # seq_len is pre-SP. Inside _forward_blocks, SP splits it.
+                    _sp_size = self.sp_ctx.sp_size if self.sp_ctx else 1
+                    _seq_per_gpu = seq_len // _sp_size
+                    _kv_len = min(_fl + _seq_per_gpu + _action_reg, _max + _action_reg)
+                    _q_len = _seq_per_gpu + _action_reg if action is not None else _seq_per_gpu
 
                     _sp_size = self.sp_ctx.sp_size if self.sp_ctx else 1
                     for blk in self.model.blocks:
@@ -1001,9 +1004,9 @@ class WANPolicyHead(ActionHead):
                                 qo_indptr_buf=_qo_buf,
                                 kv_indptr_buf=_kv_buf,
                             )
-                            # Dummy plan with max sizes so FlashInfer pre-allocates
-                            # internal buffers large enough for any future call.
-                            _max_q_total = seq_len + _action_reg
+                            # Dummy plan with max per-GPU sizes so FlashInfer
+                            # pre-allocates internal buffers.
+                            _max_q_total = seq_len // _sp_size + _action_reg
                             _max_kv_total = _max + _action_reg
                             _fi.begin_forward(
                                 torch.tensor([0, _max_q_total], dtype=torch.int32, device=noisy_input.device),
