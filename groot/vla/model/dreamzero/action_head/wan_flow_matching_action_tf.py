@@ -984,13 +984,14 @@ class WANPolicyHead(ActionHead):
                     _max = self.model.blocks[0].self_attn.max_attention_size
                     _action_reg = getattr(self.model, "num_action_per_block", 24) + \
                                   getattr(self.model, "num_state_per_block", 1)
-                    # seq_len is pre-SP. Inside _forward_blocks, SP splits it.
                     _sp_size = self.sp_ctx.sp_size if self.sp_ctx else 1
-                    _seq_per_gpu = seq_len // _sp_size
-                    _kv_len = min(_fl + _seq_per_gpu + _action_reg, _max + _action_reg)
-                    _q_len = _seq_per_gpu + _action_reg if action is not None else _seq_per_gpu
+                    # After Ulysses SP all-to-all, each GPU has the FULL sequence
+                    # with H/sp heads. So token counts use seq_len (not seq_len/sp).
+                    # Only head count is divided by sp_size.
+                    _kv_valid = min(_fl + seq_len, _max)  # valid KV after this step's write
+                    _kv_len = _kv_valid + _action_reg
+                    _q_len = seq_len + _action_reg if action is not None else seq_len
 
-                    _sp_size = self.sp_ctx.sp_size if self.sp_ctx else 1
                     for blk in self.model.blocks:
                         _sa = blk.self_attn
                         _n_heads = _sa.num_heads // _sp_size
@@ -1004,15 +1005,11 @@ class WANPolicyHead(ActionHead):
                                 qo_indptr_buf=_qo_buf,
                                 kv_indptr_buf=_kv_buf,
                             )
-                            # Dummy plan with max per-GPU sizes so FlashInfer
-                            # pre-allocates internal buffers.
-                            # Use num_frame_per_block * frame_seqlen (max possible)
+                            # Max sizes for FlashInfer internal buffer pre-allocation.
+                            # Post-SP: full sequence tokens, H/sp heads.
                             _max_seq = self.config.num_frame_per_block * self.model.frame_seqlen
-                            _max_q_total = _max_seq // _sp_size + _action_reg
+                            _max_q_total = _max_seq + _action_reg
                             _max_kv_total = _max + _action_reg
-                            # Pre-compile FlashInfer kernels with dummy plan+run.
-                            # This triggers JIT compilation so future run() calls
-                            # produce real GPU work (capturable by CUDA graphs).
                             _fi.begin_forward(
                                 torch.tensor([0, _max_q_total], dtype=torch.int32, device=noisy_input.device),
                                 torch.tensor([0, _max_kv_total], dtype=torch.int32, device=noisy_input.device),
@@ -1020,13 +1017,7 @@ class WANPolicyHead(ActionHead):
                                 head_dim_qk=_sa.head_dim,
                                 q_data_type=torch.bfloat16, causal=False,
                             )
-                            # Dummy run() to trigger kernel JIT compilation
-                            _dummy_q = torch.zeros(_max_q_total, _n_heads, _sa.head_dim, device=noisy_input.device, dtype=torch.bfloat16)
-                            _dummy_k = torch.zeros(_max_kv_total, _n_heads, _sa.head_dim, device=noisy_input.device, dtype=torch.bfloat16)
-                            _dummy_v = torch.zeros(_max_kv_total, _n_heads, _sa.head_dim, device=noisy_input.device, dtype=torch.bfloat16)
-                            _fi.run(_dummy_q, _dummy_k, _dummy_v)
                             _fi.end_forward()
-                            del _dummy_q, _dummy_k, _dummy_v
                             _sa._fi_wrapper = _fi
                         _q_indptr = torch.tensor([0, _q_len], dtype=torch.int32, device=noisy_input.device)
                         _kv_indptr = torch.tensor([0, _kv_len], dtype=torch.int32, device=noisy_input.device)
